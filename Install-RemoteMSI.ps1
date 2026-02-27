@@ -36,7 +36,6 @@ $LocalMSIPath = 'C:\Downloads'
 $RemoteTempPath = 'C:\Temp'
 $LogPath = $null  # Will be set after hostname is known
 $MaxCredentialAttempts = 2
-$InstallTimeout = 300  # 5 minutes
 
 # ============================================================================
 # LOGGING FUNCTION
