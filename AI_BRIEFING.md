@@ -16,7 +16,7 @@ The script performs **silent remote MSI installation** on a single networked mac
 
 1. **Validates hostname** against Active Directory/DNS
 2. **Checks connectivity** (privilege-aware - ICMP for admins, TCP 5985 for non-admins)
-3. **Prompts for MSI selection** (discovers in `C:\Downloads\`)
+3. **Prompts for MSI/MSIX selection** (discovers in script directory)
 4. **Handles credentials** (tests current user first, prompts if needed)
 5. **Copies MSI** to remote machine via PSSession
 6. **Executes silent installation** (msiexec /quiet /norestart)
@@ -30,8 +30,10 @@ The script performs **silent remote MSI installation** on a single networked mac
 
 ### Configuration Variables
 ```powershell
-$LocalMSIPath = 'C:\Downloads'           # Source MSI folder (user selects from here)
+$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path  # Directory containing the PS1 file
+$LocalMSIPath = $ScriptDirectory  # MSI/MSIX folder (same as script directory)
 $RemoteTempPath = 'C:\Temp'              # Where MSI is copied on remote machine
+$LogDirectory = Join-Path -Path $ScriptDirectory -ChildPath 'Logs'  # Logs folder next to script
 $MaxCredentialAttempts = 2               # Failed login attempts before abort
 $LogPath = $null                         # Set dynamically after hostname known
 ```
@@ -41,27 +43,31 @@ $LogPath = $null                         # Set dynamically after hostname known
 | Function | Purpose |
 |----------|---------|
 | `Write-Log` | Output to console (color-coded) + log file (timestamped) |
+| `Test-InstallerFilesExist` | Verifies MSI/MSIX files exist in script directory before proceeding |
 | `Test-ComputerInAD` | Validates hostname exists via DNS/AD |
 | `Test-ComputerOnline` | Tests connectivity via TCP 5985 or ICMP (privilege-aware) |
 | `Get-ValidatedHostname` | Prompts user for hostname with validation loop |
-| `Get-SessionCredentials` | Tests current user, prompts for credentials if needed |
-| `Get-MSIFile` | Finds MSI files in C:\Downloads, prompts if multiple |
+| `Request-Credentials` | Prompts user for credentials using terminal `Read-Host` (no GUI dialog) |
+| `Get-MSIFile` | Finds MSI and MSIX files in script directory, prompts if multiple |
 | `Install-RemoteMSI` | Executes msiexec on remote machine, returns exit code |
 | `Test-PendingReboot` | Checks registry + WMI for reboot requirements |
 | `Remove-RemoteFile` | Deletes MSI from remote machine |
-| `Main` | Orchestrates entire 9-phase workflow |
+| `Main` | Orchestrates entire 10-phase workflow |
 
 ### Script Phases
 
 ```
+PHASE 0: INSTALLER FILE VERIFICATION
+  └─ Verifies MSI/MSIX files exist in script directory, exits with helpful message if not
+
 PHASE 1: INPUT VALIDATION
   └─ Gets hostname via Get-ValidatedHostname (AD/DNS check)
 
 PHASE 1.5: CONNECTIVITY CHECK (non-blocking for non-admins)
   └─ Tests if machine reachable (skipped if non-admin)
 
-PHASE 2: MSI SELECTION
-  └─ User chooses from MSIs in C:\Downloads
+PHASE 2: MSI/MSIX SELECTION
+  └─ User chooses from MSI/MSIX files in script directory
 
 PHASE 3: CREDENTIAL HANDLING
   └─ Tests current user, prompts if insufficient permissions
@@ -92,7 +98,7 @@ PHASE 9: CLEANUP & LOGGING
 
 ### Logging
 - **Console**: Color-coded (GREEN=success, RED=error, YELLOW=warning, CYAN=info)
-- **File**: `C:\Downloads\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log`
+- **File**: `Logs\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log` (folder created automatically next to script)
 - **Timestamps**: Every message logged with `yyyy-MM-dd HH:mm:ss`
 
 ---
@@ -113,9 +119,15 @@ PHASE 9: CLEANUP & LOGGING
 **Why**: Only real way to know if credentials work on the remote machine
 
 **How it works**:
-- `Get-SessionCredentials` creates a test `New-PSSession`
-- If successful, credentials are valid
+- `Get-SessionCredentials` creates a test `New-PSSession` and additionally checks the remote session for local administrator membership
+- If successful and admin, credentials are valid
 - Retry loop (max 2 attempts) for incorrect password entry
+- If current account can connect but isn’t admin, user is prompted right away
+- Credential prompts use terminal `Read-Host` (approved verb `Request-Credentials`). This approach:
+  - Always works when run from double-click or command line
+  - Uses `Read-Host -AsSecureString` for password input (same security as `Get-Credential` GUI)
+  - Never attempts GUI dialog
+  - Guarantees a prompt appears in the console window
 - No credentials = use current user
 - `PSCredential` object never written to disk (SecureString in memory only)
 
@@ -142,7 +154,7 @@ PHASE 9: CLEANUP & LOGGING
 
 ⚠️ **CRITICAL**: This script **never stores, logs, or persists credentials**
 
-- `Get-Credential` returns `PSCredential` object
+- Credential prompting uses a simple "approved verb" function `Request-Credentials` that uses terminal `Read-Host` prompts and `Read-Host -AsSecureString` for password entry
 - Passwords stored as `SecureString` (encrypted in memory)
 - Used only for `New-PSSession` and `Invoke-Command`
 - Auto-purged when script ends (garbage collection)
@@ -160,6 +172,11 @@ PHASE 9: CLEANUP & LOGGING
 ### Issue: Credentials prompting failing with "Current user has access" when they don't
 **Root Cause**: Test PSSession creation succeeds with default context but fails during actual install  
 **Fix**: Gets credentials via `Get-SessionCredentials → Get-ValidatedCredentials` with PSSession test
+
+### Issue: Running script by double-click never shows credential prompt (no GUI)
+**Root Cause**: When PowerShell is started fresh from Explorer, a GUI credential dialog may not render or may not be interactive. We simplified by using terminal prompts exclusively.
+**Fix**: Replaced all credential prompts with terminal-based `Request-Credentials` function using `Read-Host` and `Read-Host -AsSecureString`. This guarantees the prompt appears in the console window and works in any context.
+**Security**: `Read-Host -AsSecureString` encrypts the password in memory, same as `Get-Credential` GUI.
 
 ### Issue: Reboot status not detected
 **Root Cause**: Single detection method incomplete  
@@ -226,6 +243,10 @@ Before deployment or modification, verify:
 **Solution**: Removed unused variable  
 **Code**: Deleted `$InstallTimeout = 300` from configuration  
 
+**Issue 4**: Script would silently connect with non‑admin credentials when launched from Explorer, then fail later during installation without ever prompting the user.  
+**Solution**: `Get-SessionCredentials` now verifies remote admin membership and forces a credential prompt if the current account cannot perform the required operations.  
+**Code**: Updated function implementation earlier in this briefing
+
 **Issue 3**: Better reboot detection needed  
 **Solution**: Implemented hybrid registry + WMI approach  
 **Code**: `Test-PendingReboot` function  
@@ -256,8 +277,9 @@ Before deployment or modification, verify:
 c:\Programs\Script\Install-RemoteMSI.ps1    ← Main script
 c:\Programs\Script\README.md                ← User documentation
 c:\Programs\Script\AI_BRIEFING.md           ← This file
-c:\Downloads\                               ← Default MSI source folder
-c:\Downloads\[ComputerName]_[timestamp]_*.log ← Generated log files
+c:\Programs\Script\*.msi or *.msix          ← MSI/MSIX files to install (same directory as script)
+c:\Programs\Script\Logs\                    ← Log files directory (created automatically)
+c:\Programs\Script\Logs\[ComputerName]_[timestamp]_*.log ← Generated log files
 ```
 
 ---

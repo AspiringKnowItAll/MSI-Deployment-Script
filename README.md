@@ -11,15 +11,17 @@
 ## Features
 
 ### Input Validation & Security
+- **Early file validation** - verifies MSI/MSIX files exist before proceeding, with helpful error message
 - **Interactive hostname input** with validation against DNS and Active Directory
 - **Connectivity testing** with privilege-aware fallback (TCP port 5985 for non-admin users, ICMP for admin users)
-- **Dynamic credential handling** - checks current user permissions first, then prompts for alternate credentials if needed
+- **Dynamic credential handling** – script will now not only verify that credentials can establish a session but also confirm that the account is a **local administrator** on the target. If the current user can connect but lacks admin rights, the tool will prompt immediately for alternate credentials using simple terminal prompts.
+  **Security Note**: Terminal prompts with `Read-Host -AsSecureString` are just as secure as the GUI `Get-Credential` dialog – passwords are encrypted in memory and never displayed on screen.
 - **Credential security** - uses PowerShell `PSCredential` objects with SecureString (never written to disk)
 - **Retry logic** - up to 2 failed credential attempts before aborting
 
 ### MSI Management
-- **Automatic MSI discovery** in `C:\Downloads\` 
-- **Interactive selection** if multiple MSI files exist
+- **Automatic MSI/MSIX discovery** in script directory
+- **Interactive selection** if multiple files exist
 - **Silent installation** using `msiexec.exe /quiet /norestart`
 - **MSI cleanup** on success; preserved on failure for troubleshooting
 - **Exit code interpretation** - correctly handles code 3010 (success but reboot required)
@@ -47,7 +49,7 @@ Uses **hybrid detection approach** for maximum reliability:
   - 🔵 **CYAN** (INFO) - Informational messages
 - **Smart logging** - log file created at start, renamed based on outcome
 - **Log naming**: `[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log`
-- **Log location**: `C:\Downloads\` (same as MSI source)
+- **Log location**: `Logs\` folder (created automatically next to the script)
 
 ---
 
@@ -64,7 +66,7 @@ Uses **hybrid detection approach** for maximum reliability:
 - **Best practice**: Run as admin on source if possible (enables ICMP connectivity test)
 
 ### Prerequisites
-- MSI file placed in `C:\Downloads\` on the local machine
+- MSI or MSIX file placed in the same directory as the `Install-RemoteMSI.ps1` script
 - Target machine accessible via network
 - Target machine in Active Directory (or resolvable via DNS)
 - WinRM service running on target machine
@@ -97,6 +99,18 @@ The script will guide you through:
    - Admin users see connectivity status
 
 2. **MSI Selection** (if multiple MSI files exist)
+
+3. **Credential Entry** (terminal prompts)
+   ```
+   Administrator credentials required for SERVER01
+   User: DOMAIN\AdminUser
+   Password: ••••••••••••
+   ```
+   - Credentials are always entered directly in the terminal window using keyboard input
+   - No GUI dialog is used (ensures tool works when double-clicked from Explorer)
+   - Password is encrypted as `SecureString` in memory (same security as `Get-Credential`)
+   - Never displayed on screen, never logged to file
+
    ```
    Found 3 MSI files. Please select one:
      [1] Application-v1.0.0.msi
@@ -118,6 +132,9 @@ The script will guide you through:
 
 ### Example Output
 
+*If the first attempt to open a remote session fails with access denied, the script will automatically prompt for alternate credentials and retry.*
+
+
 ```
 ======================================================================
 Remote MSI Installation Tool
@@ -133,9 +150,26 @@ Remote MSI Installation Tool
 Installation Summary
 ======================================================================
 Status: SUCCESS - No Reboot Required
-Log File: C:\Downloads\SERVER01_20260226_143242_Success.log
+Log File: Logs\SERVER01_20260226_143242_Success.log
 ======================================================================
 ```
+
+---
+
+## Execution Behavior When Double‑Clicked
+
+If you run the script by double‐clicking it in Explorer or by using "Run with
+PowerShell" the tool will:
+
+- Prompt for hostname and validate it exactly the same as when run in a
+  console.
+- Automatically ask for administrator credentials in the terminal window if the current user can
+  connect but lacks local admin rights on the target.
+- Use only straightforward terminal prompts (type username, type password) - no GUI dialogs.
+- Pause at the end of execution so the new window does not close immediately.
+
+You will see a final message `Press Enter to close this window...` which can be
+ignored when running from an existing terminal.
 
 ---
 
@@ -151,17 +185,17 @@ Log File: C:\Downloads\SERVER01_20260226_143242_Success.log
 ## Log File Reference
 
 ### Location
-`C:\Downloads\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log`
+`Logs\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log` (folder created automatically next to the script)
 
 ### Example Log Contents
 ```
 2026-02-26 14:32:15 [INFO] Installation session started for SERVER01
 2026-02-26 14:32:16 [SUCCESS] Hostname validation successful.
-2026-02-26 14:32:18 [INFO] Scanning for MSI files in 'C:\Downloads'...
+2026-02-26 14:32:18 [INFO] Scanning for MSI and MSIX files in 'C:\Programs\Script'...
 2026-02-26 14:32:18 [SUCCESS] Found MSI file: MyApp-v2.0.msi
 2026-02-26 14:32:22 [INFO] Checking if current user can access remote machine...
-2026-02-26 14:32:25 [WARNING] Current user does not have sufficient permissions.
-2026-02-26 14:32:25 [INFO] Please provide alternate credentials.
+2026-02-26 14:32:25 [WARNING] Unable to connect using current user: Access is denied.
+2026-02-26 14:32:25 [INFO] Please provide credentials to authenticate.
 2026-02-26 14:32:35 [SUCCESS] Credentials validated successfully.
 2026-02-26 14:32:38 [SUCCESS] Remote session created successfully.
 2026-02-26 14:32:38 [INFO] Preparing remote environment...
@@ -215,10 +249,11 @@ Log File: C:\Downloads\SERVER01_20260226_143242_Success.log
 Edit these variables in the script if needed:
 
 ```powershell
-$LocalMSIPath = 'C:\Downloads'           # Source MSI directory
 $RemoteTempPath = 'C:\Temp'              # Temp directory on remote machine
 $MaxCredentialAttempts = 2               # Failed credential attempts before abort
 ```
+
+**Note**: MSI/MSIX files should be placed in the same directory as the `Install-RemoteMSI.ps1` script. The script automatically scans for `*.msi` and `*.msix` files there.
 
 ### MSI Silent Installation Flags
 
@@ -239,7 +274,7 @@ To modify these, edit the `Install-RemoteMSI` function's `msiexec.exe` command l
 4. **MSI Compatibility**: Verify MSI is compatible with target OS and architecture before installation
 5. **Network Availability**: Ensure network connectivity to target machines is stable
 6. **Log Review**: Always review log files for detailed error information
-7. **Maintenance**: Clean up old log files periodically from `C:\Downloads\`
+7. **Maintenance**: Clean up old log files periodically from the `Logs\` folder next to the script
 
 ---
 

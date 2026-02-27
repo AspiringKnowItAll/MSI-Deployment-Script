@@ -32,8 +32,10 @@ $ErrorActionPreference = 'Stop'
 # CONFIGURATION
 # ============================================================================
 
-$LocalMSIPath = 'C:\Downloads'
+$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LocalMSIPath = $ScriptDirectory
 $RemoteTempPath = 'C:\Temp'
+$LogDirectory = Join-Path -Path $ScriptDirectory -ChildPath 'Logs'
 $LogPath = $null  # Will be set after hostname is known
 $MaxCredentialAttempts = 2
 
@@ -192,6 +194,32 @@ function Get-ValidatedHostname {
 # CREDENTIAL HANDLING
 # ============================================================================
 
+function Request-Credentials {
+    <#
+    .SYNOPSIS
+        Prompts the user for credentials using console Read-Host.
+        No GUI dialog - guaranteed to work whether run in terminal or
+        when launched by double-clicking from Explorer. Password is
+        encrypted as SecureString in memory (just as secure as Get-Credential).
+    .PARAMETER Message
+        Optional message to display before prompts.
+    #>
+    param(
+        [string]$Message = "Enter credentials"
+    )
+
+    Write-Host $Message -ForegroundColor Cyan
+    $user = Read-Host "User"
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        return $null
+    }
+    $pass = Read-Host "Password" -AsSecureString
+    if ($null -eq $pass) {
+        return $null
+    }
+    return New-Object System.Management.Automation.PSCredential($user, $pass)
+}
+
 function Get-ValidatedCredentials {
     <#
     .SYNOPSIS
@@ -234,8 +262,7 @@ function Get-ValidatedCredentials {
             Write-Log "Credentials validation failed: $($_.Exception.Message)" -Level WARNING
             Write-Log "Prompting for new credentials..." -Level INFO
             
-            $InitialCredential = Get-Credential -Message "Enter credentials for $domain" -Title "Authentication Required"
-            
+            $InitialCredential = Request-Credentials -Message "Enter credentials for $domain"
             if ($null -eq $InitialCredential) {
                 Write-Log "Credential entry cancelled by user." -Level ERROR
                 return $null
@@ -250,6 +277,9 @@ function Get-SessionCredentials {
     <#
     .SYNOPSIS
         Determines if current user credentials work, or prompts for new ones.
+        Additionally verifies that the current identity has local administrator
+        rights on the remote machine so that later installation operations will
+        succeed.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -259,25 +289,43 @@ function Get-SessionCredentials {
     Write-Log "Checking if current user can access remote machine..." -Level INFO
     
     try {
+        # establish a temporary session to test connectivity
         $testSession = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
+
+        # verify administrative privilege over the session
+        $isAdmin = Invoke-Command -Session $testSession -ScriptBlock {
+            $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+            $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+
         Remove-PSSession -Session $testSession -ErrorAction SilentlyContinue
-        
-        Write-Log "Current user has access to remote machine." -Level SUCCESS
-        return $null  # Use current user credentials
-    }
-    catch {
-        Write-Log "Current user does not have sufficient permissions." -Level WARNING
-        Write-Log "Please provide alternate credentials." -Level INFO
-        
-        $credential = Get-Credential -Message "Authentication required for $ComputerName"
-        
+
+        if ($isAdmin) {
+            Write-Log "Current user has administrative access to the remote machine." -Level SUCCESS
+            return $null  # use current user credentials
+        }
+
+        # if we can connect but are not admin, we need different creds
+        Write-Log "Connected as non-administrator on remote machine." -Level WARNING
+        Write-Log "Administrator credentials are required." -Level INFO
+        $credential = Request-Credentials -Message "Administrator credentials required for $ComputerName"
         if ($null -eq $credential) {
             Write-Log "Credential entry cancelled by user." -Level ERROR
             return $null
         }
+        return Get-ValidatedCredentials -ComputerName $ComputerName -InitialCredential $credential
+    }
+    catch {
+        # failed to connect with current user; prompt for credentials
+        Write-Log "Unable to connect using current user: $($_.Exception.Message)" -Level WARNING
+        Write-Log "Please provide credentials to authenticate." -Level INFO
 
-        $validatedCredential = Get-ValidatedCredentials -ComputerName $ComputerName -InitialCredential $credential
-        return $validatedCredential
+        $credential = Request-Credentials -Message "Credentials required for $ComputerName"
+        if ($null -eq $credential) {
+            Write-Log "Credential entry cancelled by user." -Level ERROR
+            return $null
+        }
+        return Get-ValidatedCredentials -ComputerName $ComputerName -InitialCredential $credential
     }
 }
 
@@ -285,25 +333,69 @@ function Get-SessionCredentials {
 # MSI FILE SELECTION
 # ============================================================================
 
+function Test-InstallerFilesExist {
+    <#
+    .SYNOPSIS
+        Verifies that at least one MSI or MSIX file exists in the script directory.
+        Exits with helpful message if none found.
+    #>
+    
+    if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
+        Write-Host "`n" + ("=" * 70) -ForegroundColor Red
+        Write-Host "ERROR: Script Directory Not Found" -ForegroundColor Red
+        Write-Host ("=" * 70)
+        Write-Host "The script directory does not exist:`n  $LocalMSIPath" -ForegroundColor Yellow
+        Write-Host "`nPress Enter to exit..."
+        Read-Host | Out-Null
+        exit 1
+    }
+
+    $msiFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msi' -ErrorAction SilentlyContinue)
+    $msixFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msix' -ErrorAction SilentlyContinue)
+    $allInstallerFiles = @($msiFiles) + @($msixFiles)
+    
+    if ($allInstallerFiles.Count -eq 0) {
+        Write-Host "`n" + ("=" * 70) -ForegroundColor Yellow
+        Write-Host "WARNING: No Installer Files Found" -ForegroundColor Yellow
+        Write-Host ("=" * 70)
+        Write-Host "This script requires at least one MSI or MSIX file to proceed.`n" -ForegroundColor White
+        Write-Host "Solution:" -ForegroundColor Cyan
+        Write-Host "  1. Place your MSI or MSIX installer file(s) in the same directory as this script" -ForegroundColor Cyan
+        Write-Host "     Location: $LocalMSIPath`n" -ForegroundColor Cyan
+        Write-Host "  2. Run the script again`n" -ForegroundColor Cyan
+        Write-Host "Example:" -ForegroundColor Cyan
+        Write-Host "  - MyApplication.msi" -ForegroundColor Cyan
+        Write-Host "  - MyApplication.msix" -ForegroundColor Cyan
+        Write-Host ("=" * 70)
+        Write-Host "`nPress Enter to exit..."
+        Read-Host | Out-Null
+        exit 1
+    }
+}
+
 function Get-MSIFile {
     <#
     .SYNOPSIS
-        Finds MSI files in C:\Downloads and prompts user to select one if multiple exist.
+        Finds MSI and MSIX files in the script directory and prompts user to select one if multiple exist.
     #>
     
-    Write-Log "Scanning for MSI files in '$LocalMSIPath'..." -Level INFO
+    Write-Log "Scanning for MSI and MSIX files in '$LocalMSIPath'..." -Level INFO
     
     if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
-        Write-Log "Download directory '$LocalMSIPath' does not exist." -Level ERROR
+        Write-Log "Script directory '$LocalMSIPath' does not exist." -Level ERROR
         return $null
     }
 
     $msiFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msi' -ErrorAction SilentlyContinue)
+    $msixFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msix' -ErrorAction SilentlyContinue)
+    $allInstallerFiles = @($msiFiles) + @($msixFiles)
     
-    if ($msiFiles.Count -eq 0) {
-        Write-Log "No MSI files found in '$LocalMSIPath'." -Level ERROR
+    if ($allInstallerFiles.Count -eq 0) {
+        Write-Log "No MSI or MSIX files found in '$LocalMSIPath'." -Level ERROR
         return $null
     }
+    
+    $msiFiles = $allInstallerFiles
 
     if ($msiFiles.Count -eq 1) {
         Write-Log "Found MSI file: $($msiFiles[0].Name)" -Level SUCCESS
@@ -492,15 +584,26 @@ function Remove-RemoteFile {
 function Main {
     try {
         # ====================================================================
+        # PHASE 0: VERIFY INSTALLER FILES EXIST
+        # ====================================================================
+        
+        Test-InstallerFilesExist
+        
+        # ====================================================================
         # PHASE 1: INPUT VALIDATION
         # ====================================================================
         
         $ComputerName = Get-ValidatedHostname
         
         # Set log path now that we have hostname
+        # Ensure Logs directory exists
+        if (-not (Test-Path -Path $LogDirectory)) {
+            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+        }
+        
         $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
         $baseLogName = "{0}_{1}" -f $ComputerName, $timestamp
-        $LogPath = Join-Path -Path $LocalMSIPath -ChildPath "${baseLogName}_Incomplete.log"
+        $LogPath = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Incomplete.log"
         
         Write-Log "Installation session started for $ComputerName" -Level INFO
         
@@ -527,7 +630,7 @@ function Main {
         
         $msiFile = Get-MSIFile
         if ($null -eq $msiFile) {
-            $errorLog = Join-Path -Path $LocalMSIPath -ChildPath "${baseLogName}_Failure.log"
+            $errorLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Failure.log"
             if ($LogPath -ne $errorLog) {
                 if (Test-Path $LogPath) { Move-Item -Path $LogPath -Destination $errorLog -Force }
             }
@@ -556,11 +659,29 @@ function Main {
             else {
                 $session = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
             }
-            
             Write-Log "Remote session created successfully." -Level SUCCESS
         }
         catch {
-            throw "Failed to create remote session: $($_.Exception.Message)"
+            # if we failed because of access, try acquiring credentials and retry once
+            if ($_.Exception.Message -match 'Access is denied' -or $_.Exception.Message -match 'permission') {
+                Write-Log "Session creation failed due to permissions. Prompting for credentials again..." -Level WARNING
+                $credential = Get-SessionCredentials -ComputerName $ComputerName
+                if ($credential) {
+                    try {
+                        $session = New-PSSession -ComputerName $ComputerName -Credential $credential -ErrorAction Stop
+                        Write-Log "Remote session created successfully with alternate credentials." -Level SUCCESS
+                    }
+                    catch {
+                        throw "Failed to create remote session even after prompting for credentials: $($_.Exception.Message)"
+                    }
+                }
+                else {
+                    throw "Could not obtain valid credentials for remote session."
+                }
+            }
+            else {
+                throw "Failed to create remote session: $($_.Exception.Message)"
+            }
         }
         
         # ====================================================================
@@ -666,7 +787,7 @@ function Main {
             }
             
             # Rename log to Success
-            $successLog = Join-Path -Path $LocalMSIPath -ChildPath "${baseLogName}_Success.log"
+            $successLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Success.log"
             if (Test-Path $LogPath) {
                 Move-Item -Path $LogPath -Destination $successLog -Force
                 $LogPath = $successLog
@@ -677,7 +798,7 @@ function Main {
             Write-Log "Installation FAILED on $ComputerName - MSI preserved for troubleshooting." -Level ERROR
             
             # Rename log to Failure
-            $failureLog = Join-Path -Path $LocalMSIPath -ChildPath "${baseLogName}_Failure.log"
+            $failureLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Failure.log"
             if (Test-Path $LogPath) {
                 Move-Item -Path $LogPath -Destination $failureLog -Force
                 $LogPath = $failureLog
@@ -710,3 +831,13 @@ function Main {
 
 # Execute main function
 Main
+
+# When the script is launched from Explorer (double‑click), the PowerShell window
+# will close immediately once the script ends.  A simple pause gives users a
+# chance to read any error messages or credential prompts before the window
+# disappears.  The prompt is harmless when running from an existing console.
+Write-Host "`nScript execution finished. Press Enter to close this window..."
+Read-Host | Out-Null
+
+
+
