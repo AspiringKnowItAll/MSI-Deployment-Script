@@ -858,14 +858,7 @@ function Copy-MSIWithRetry {
             $attempt++
             try {
                 Write-Log "Transfer attempt $attempt/$($TransferRetryDelays.Count) to $($Session.ComputerName)." -Level INFO
-                $previousProgressPreference = $ProgressPreference
-                $ProgressPreference = 'SilentlyContinue'
-                try {
-                    Copy-Item -Path $LocalPath -Destination $RemotePath -ToSession $Session -Force -ErrorAction Stop
-                }
-                finally {
-                    $ProgressPreference = $previousProgressPreference
-                }
+                Copy-Item -Path $LocalPath -Destination $RemotePath -ToSession $Session -Force -ErrorAction Stop
                 Write-Log "Transfer succeeded to $($Session.ComputerName)." -Level SUCCESS
                 return $true
             }
@@ -1025,11 +1018,38 @@ function Invoke-MachineInstall {
         }
 
         Write-Log "[$ComputerName] Starting installer execution..." -Level INFO
-        $exitCode = Invoke-Command -Session $session -ScriptBlock {
+        $installJob = Invoke-Command -Session $session -AsJob -ScriptBlock {
             param($RemotePath)
             $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $RemotePath, '/quiet', '/norestart') -Wait -PassThru -NoNewWindow
             return [int]$process.ExitCode
         } -ArgumentList $remoteInstallerPath
+
+        $installSpinnerFrames = @('|', '/', '-', '\')
+        $installSpinnerIndex = 0
+        $installSpinnerMessage = "[$ComputerName] MSI installation in progress"
+
+        while ($installJob.State -in @('NotStarted', 'Running', 'Blocked')) {
+            $frame = $installSpinnerFrames[$installSpinnerIndex % $installSpinnerFrames.Count]
+            Write-Host "`r[$frame] $installSpinnerMessage" -NoNewline -ForegroundColor Cyan
+            $installSpinnerIndex++
+            Start-Sleep -Milliseconds 150
+        }
+
+        Write-Host "`r[OK] $installSpinnerMessage" -ForegroundColor Cyan
+
+        if ($installJob.State -ne 'Completed') {
+            $state = $installJob.State
+            Remove-Job -Job $installJob -Force -ErrorAction SilentlyContinue
+            throw "Installer execution job ended in unexpected state '$state'."
+        }
+
+        $exitCodeOutput = @($installJob | Receive-Job -Keep)
+        Remove-Job -Job $installJob -Force -ErrorAction SilentlyContinue
+        if ($exitCodeOutput.Count -eq 0) {
+            throw 'Installer execution did not return an exit code.'
+        }
+
+        $exitCode = [int]$exitCodeOutput[0]
 
         $desc = Get-MSIExitDescription -ExitCode $exitCode
         Write-Log "[$ComputerName] Installer completed with exit code $exitCode ($desc)." -Level INFO
@@ -1116,7 +1136,7 @@ function Get-ChunkedArrays {
         $end = [Math]::Min($i + $ChunkSize - 1, $InputArray.Count - 1)
         $chunks += ,(@($InputArray[$i..$end]))
     }
-    return $chunks
+    return ,$chunks
 }
 
 function Update-BatchFileForSuccesses {
@@ -1198,6 +1218,7 @@ function Invoke-Deployment {
 
     $batchSize = [Math]::Max($ThrottleLimit, 1)
     $chunks = Get-ChunkedArrays -InputArray $Machines -ChunkSize $batchSize
+    Write-Log "Batch planner: Machines=$($Machines.Count), RequestedThrottle=$ThrottleLimit, EffectiveThrottle=$batchSize, PlannedBatches=$($chunks.Count), HostPS=$($PSVersionTable.PSVersion.Major)." -Level INFO
 
     for ($chunkIndex = 0; $chunkIndex -lt $chunks.Count; $chunkIndex++) {
         $chunk = @($chunks[$chunkIndex])
@@ -1214,9 +1235,8 @@ function Invoke-Deployment {
         $canRunParallel = $batchSize -gt 1 -and $PSVersionTable.PSVersion.Major -ge 7
         if ($canRunParallel) {
             Write-Log "Running this batch in parallel with throttle $batchSize." -Level INFO
-            Write-Log 'Multiple installer transfers are running concurrently. Transfer progress bars are intentionally suppressed.' -Level INFO
 
-            $parallelResults = $chunk | ForEach-Object -Parallel {
+            $parallelJob = $chunk | ForEach-Object -Parallel {
                 $installerFile = $using:InstallerFile
                 $credential = $using:Credential
                 $remoteTempPath = $using:RemoteTempPath
@@ -1395,7 +1415,29 @@ function Invoke-Deployment {
                         Remove-PSSession -Session $session -ErrorAction SilentlyContinue
                     }
                 }
-            } -ThrottleLimit $batchSize
+            } -ThrottleLimit $batchSize -AsJob
+
+            $batchSpinnerFrames = @('|', '/', '-', '\')
+            $batchSpinnerIndex = 0
+            $batchSpinnerMessage = "Batch $($chunkIndex + 1)/$($chunks.Count) active (parallel transfer/install in progress)"
+
+            while ($parallelJob.State -in @('NotStarted', 'Running', 'Blocked')) {
+                $frame = $batchSpinnerFrames[$batchSpinnerIndex % $batchSpinnerFrames.Count]
+                Write-Host "`r[$frame] $batchSpinnerMessage" -NoNewline -ForegroundColor Cyan
+                $batchSpinnerIndex++
+                Start-Sleep -Milliseconds 150
+            }
+
+            Write-Host "`r[OK] $batchSpinnerMessage" -ForegroundColor Cyan
+
+            if ($parallelJob.State -ne 'Completed') {
+                $parallelState = $parallelJob.State
+                Remove-Job -Job $parallelJob -Force -ErrorAction SilentlyContinue
+                throw "Parallel batch processing ended with state '$parallelState'."
+            }
+
+            $parallelResults = @($parallelJob | Receive-Job -Keep)
+            Remove-Job -Job $parallelJob -Force -ErrorAction SilentlyContinue
 
             foreach ($parallelResult in $parallelResults) {
                 $parallelResult.Attempt = $attemptMap[$parallelResult.MachineName]
@@ -1497,6 +1539,10 @@ function Write-Summary {
     Write-Host "`n" + ('=' * 70)
     Write-Host 'Deployment Summary' -ForegroundColor Cyan
     Write-Host ('=' * 70)
+    $overallStatus = if ($failedCount -eq 0) { 'SUCCESS' } elseif ($successCount -gt 0) { 'PARTIAL SUCCESS' } else { 'FAILED' }
+    $overallColor = if ($failedCount -eq 0) { 'Green' } elseif ($successCount -gt 0) { 'Yellow' } else { 'Red' }
+    Write-Host "OVERALL RESULT: $overallStatus" -ForegroundColor $overallColor
+    Write-Host ('=' * 70)
     Write-Host "Total Machines: $totalCount"
     Write-Host "Successful: $successCount"
     Write-Host "Failed: $failedCount"
@@ -1504,6 +1550,60 @@ function Write-Summary {
     Write-Host "Total Duration: $([int]$duration.TotalMinutes)m $($duration.Seconds)s"
     Write-Host "Log File: $script:LogPath"
     Write-Host ('=' * 70)
+
+    $machineWidth = 22
+    $statusWidth = 10
+    $attemptWidth = 8
+    $exitWidth = 22
+    $rebootWidth = 8
+    $durationWidth = 10
+
+    $line = '+' + ('-' * $machineWidth) + '+' + ('-' * $statusWidth) + '+' + ('-' * $attemptWidth) + '+' + ('-' * $exitWidth) + '+' + ('-' * $rebootWidth) + '+' + ('-' * $durationWidth) + '+'
+    $header = "|{0}|{1}|{2}|{3}|{4}|{5}|" -f @(
+        'Machine'.PadRight($machineWidth),
+        'Status'.PadRight($statusWidth),
+        'Attempt'.PadRight($attemptWidth),
+        'Exit'.PadRight($exitWidth),
+        'Reboot'.PadRight($rebootWidth),
+        'Seconds'.PadRight($durationWidth)
+    )
+
+    Write-Host ''
+    Write-Host 'Result Table' -ForegroundColor Cyan
+    Write-Host $line
+    Write-Host $header
+    Write-Host $line
+
+    foreach ($row in $FinalResults | Sort-Object -Property MachineName) {
+        $machineValue = [string]$row.MachineName
+        if ($machineValue.Length -gt $machineWidth) {
+            $machineValue = $machineValue.Substring(0, $machineWidth)
+        }
+
+        $statusValue = [string]$row.Status
+        $attemptValue = [string]$row.Attempt
+        $exitValue = if ($row.ExitCode -ge 0) { "$($row.ExitCode) ($($row.ExitDescription))" } else { 'N/A' }
+        if ($exitValue.Length -gt $exitWidth) {
+            $exitValue = $exitValue.Substring(0, $exitWidth)
+        }
+
+        $rebootValue = if ($row.RebootRequired) { 'Yes' } else { 'No' }
+        $secondsValue = [string]$row.DurationSeconds
+
+        $rowLine = "|{0}|{1}|{2}|{3}|{4}|{5}|" -f @(
+            $machineValue.PadRight($machineWidth),
+            $statusValue.PadRight($statusWidth),
+            $attemptValue.PadRight($attemptWidth),
+            $exitValue.PadRight($exitWidth),
+            $rebootValue.PadRight($rebootWidth),
+            $secondsValue.PadRight($durationWidth)
+        )
+
+        $rowColor = if ($row.Status -eq 'Success') { 'Green' } else { 'Red' }
+        Write-Host $rowLine -ForegroundColor $rowColor
+    }
+
+    Write-Host $line
 
     Write-Log "Summary: Total=$totalCount, Success=$successCount, Failed=$failedCount, RebootRequired=$rebootCount, DurationSeconds=$([int]$duration.TotalSeconds)" -Level INFO
 
@@ -1559,10 +1659,10 @@ function Main {
 
             $failedFinal = @($collapsed | Where-Object { $_.Status -eq 'Failed' })
             if ($failedFinal.Count -gt 0) {
-                exit 1
+                return 1
             }
 
-            exit 0
+            return 0
         }
 
         # Batch mode
@@ -1611,23 +1711,25 @@ function Main {
 
         $failedFinalBatch = @($finalPerMachine | Where-Object { $_.Status -eq 'Failed' })
         if ($failedFinalBatch.Count -gt 0) {
-            exit 1
+            return 1
         }
 
-        exit 0
+        return 0
     }
     catch {
         Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
         Write-Host "`n[DEPLOYMENT FAILED]" -ForegroundColor Red
         Write-Host "Log File: $script:LogPath" -ForegroundColor Yellow
-        exit 1
+        return 1
     }
 }
 
-Main
+$finalExitCode = Main
 
 Write-Host "`nScript execution finished. Press Enter to close this window..."
 Read-Host | Out-Null
+
+exit $finalExitCode
 
 
 
