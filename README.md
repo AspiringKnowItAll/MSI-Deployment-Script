@@ -1,54 +1,61 @@
 # Remote MSI/MSIX Installation Script
 
 ## Overview
-`Install-RemoteMSI.ps1` installs MSI/MSIX packages to remote Windows machines in either single-machine or batch mode.
+`Install-RemoteMSI.ps1` performs silent remote MSI/MSIX deployment to Windows machines in single-machine or batch mode.
 
-Key behaviors:
-- Credential validation happens early using a probe machine
-- Credential prompts use terminal `Read-Host` (no GUI popup)
-- Hostnames are sanitized before use
-- Batch files (`.txt`/`.csv`) are auto-discovered from script directory or manually supplied
-- One aggregated log is generated per script run
+Core behaviors:
+- Validates credentials early using a probe machine
+- Uses terminal-only credential prompts (`Read-Host`, no GUI dialogs)
+- Sanitizes hostnames before use
+- Auto-discovers batch source files (`.txt`, `.csv`) from script directory
+- Supports transfer retry cycles and per-machine retry rounds
+- Produces one aggregated run log per execution
 
 ---
 
 ## Features
 
 ### Security and Validation
-- Credential-first validation (before heavy batch pre-processing)
-- Terminal-only secure credential entry (`Read-Host -AsSecureString`)
-- Hostname sanitization for single and batch modes
-- AD/DNS and online pre-validation for batch execution lists
-- Startup runtime check before prompts (PS host/version capability)
+- Credential-first workflow (before heavy batch processing)
+- Remote admin verification during credential probe
+- Hostname sanitization for both single and batch modes
+- AD/DNS and online pre-validation for batch targets
+- Runtime startup gate for PowerShell host/version capability
 
 ### Batch Execution
-- Runtime mode selection: single machine or batch
-- Batch input from first column only (no header required)
-- Parallel throttle prompt (`1` = sequential)
-- Retry rounds apply only to failed machines after each batch
-- Retry prompts show attempt count, error code, and error description
+- Runtime selection: single machine or batch
+- Batch parsing from first column (header not required)
+- Configurable throttle (`1` = sequential)
+- Parallel execution on PowerShell 7+
+- Retry prompts apply only to failed machines after each batch
 
 ### File Transfer and Install
-- Installer discovery in script directory (`*.msi`, `*.msix`)
+- Installer discovery from script directory (`*.msi`, `*.msix`)
 - Transfer retry delays: `5s`, `10s`, `30s`, `60s`
-- After transfer retries fail, operator can retry cycle or abort
-- MSI exit code mapping to human-readable meanings
-- MSI is preserved on non-corruption failures for future retry
+- After retry exhaustion, operator can retry transfer cycle or abort
+- Silent install via `msiexec /quiet /norestart`
+- MSI/MSIX exit code mapping to human-readable descriptions
+- MSI cleanup on success and on corruption/open-package failures (`1619`); preserved on other failures for troubleshooting
+
+### Reboot Logic (Current Behavior)
+- The `Reboot Required` result now means **install-caused reboot only**.
+- Script still takes pre-install and post-install reboot snapshots, but pre-existing reboot state on the target machine is **not** counted as install-required reboot.
+- Summary table displays reboot as simple `Yes`/`No`.
 
 ### Logging and State
-- One log per script run: `Logs\Deployment_[yyyyMMdd_HHmmss].log`
-- PS5→PS7 relaunch reuses the same log file path (no parent/child split logs)
-- Console and file logging with timestamps and severity
-- Successful batch machines are commented out in source list file
+- One log per run: `Logs\Deployment_[yyyyMMdd_HHmmss].log`
+- PS5 → PS7 relaunch reuses the same run log path
+- Color-coded console output + timestamped file output
+- Successful batch machines are commented out in source list file for rerun efficiency
 
 ---
 
 ## Requirements
-- PowerShell 5.1+ (PowerShell 7+ recommended for parallel runspace mode)
-- WinRM enabled on target machines
-- Administrative rights on target machines for installation
-- MSI/MSIX file in same directory as `Install-RemoteMSI.ps1`
-- Local administrator rights on the orchestrator machine are required only for optional PS7 install via Windows Update/WSUS
+- PowerShell 5.1+ (PowerShell 7+ recommended for parallel mode)
+- WinRM enabled and reachable on target machines
+- Administrative rights on target machines
+- MSI/MSIX installer in same directory as `Install-RemoteMSI.ps1`
+- Local administrator rights on orchestrator only if attempting optional PS7 install via Windows Update/WSUS
 
 ---
 
@@ -58,17 +65,17 @@ Key behaviors:
 .\Install-RemoteMSI.ps1
 ```
 
-Optional switch for unattended execution:
+Unattended/non-interactive mode:
 ```powershell
 .\Install-RemoteMSI.ps1 -NonInteractive
 ```
 
 Interactive flow:
 1. Select mode (`Single` or `Batch`)
-2. Provide target hostname or machine list file
-3. Validate credentials against probe machine
+2. Provide hostname or batch source file
+3. Validate credentials with probe machine
 4. Select installer file
-5. Run execution (`parallel threads` prompt shown for batch)
+5. Execute deployment (parallel prompt in batch mode)
 6. Handle retry prompts for failed machines only
 
 ---
@@ -80,9 +87,10 @@ Interactive flow:
 ---
 
 ## Notes
-- Parallel execution path uses PowerShell 7 runspaces. On PowerShell 5.1, requested parallel throttle falls back to sequential with a warning.
-- Runtime check occurs at script startup. If PS7+ is already installed, install is skipped and operator can relaunch into `pwsh` (default yes).
-- If PS7+ is missing in interactive runs, script can attempt installation using the configured Windows Update service (WSUS/Microsoft Update policy path).
-- If no approved/applicable PS7 update is available, install fails, or run is unattended, script continues with sequential fallback behavior.
-- `-NonInteractive` suppresses runtime prompts where applicable and uses fallback behavior.
-- Quiet MSI execution does not provide reliable real-time percentage progress back to caller; status is tracked operationally as running/completed with exit code.
+- Parallel path uses PowerShell 7 runspaces; PowerShell 5.1 falls back to sequential with warning.
+- Startup host check runs before normal prompts.
+- If PS7 is present, operator can relaunch into `pwsh` (default yes in interactive runs).
+- If PS7 is missing (interactive), script can optionally attempt install through configured Windows Update service.
+- If PS7 install is unavailable/fails, script continues with fallback behavior.
+- `-NonInteractive` suppresses interactive runtime prompts where applicable.
+- Quiet MSI execution does not provide reliable real-time progress percentages; status is tracked operationally by job state and final exit code.

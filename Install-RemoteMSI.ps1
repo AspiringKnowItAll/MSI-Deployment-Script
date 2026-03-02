@@ -880,47 +880,130 @@ function Copy-MSIWithRetry {
     }
 }
 
-function Test-PendingReboot {
+function Get-PendingRebootState {
     param(
         [Parameter(Mandatory = $true)]
         [System.Management.Automation.Runspaces.PSSession]$Session
     )
 
     try {
-        $pendingReboot = Invoke-Command -Session $Session -ScriptBlock {
-            $requiresReboot = $false
-
-            $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-            $regPath2 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update'
-
-            $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-            if ($pendingRename -and $pendingRename.PendingFileRenameOperations) {
-                $requiresReboot = $true
+        $pendingRebootState = Invoke-Command -Session $Session -ScriptBlock {
+            $state = [ordered]@{
+                PendingFileRenameOperations = $false
+                WindowsUpdateRebootRequired = $false
+                ComponentBasedServicingRebootPending = $false
+                WmiRebootRequired = $false
             }
 
-            $wuReboot = Get-ItemProperty -Path $regPath2 -Name 'RebootRequired' -ErrorAction SilentlyContinue
-            if ($wuReboot -and $wuReboot.RebootRequired) {
-                $requiresReboot = $true
+            try {
+                $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+                $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+                if ($pendingRename -and $pendingRename.PendingFileRenameOperations) {
+                    $state.PendingFileRenameOperations = $true
+                }
+            }
+            catch {
+                # ignore probe errors
+            }
+
+            try {
+                $wuRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+                if (Test-Path -Path $wuRebootPath) {
+                    $state.WindowsUpdateRebootRequired = $true
+                }
+            }
+            catch {
+                # ignore probe errors
+            }
+
+            try {
+                $cbsRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+                if (Test-Path -Path $cbsRebootPath) {
+                    $state.ComponentBasedServicingRebootPending = $true
+                }
+            }
+            catch {
+                # ignore probe errors
             }
 
             try {
                 $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
                 if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
-                    $requiresReboot = $true
+                    $state.WmiRebootRequired = $true
                 }
             }
             catch {
                 # ignore WMI probe errors
             }
 
-            return $requiresReboot
+            $any = $state.PendingFileRenameOperations -or
+                $state.WindowsUpdateRebootRequired -or
+                $state.ComponentBasedServicingRebootPending -or
+                $state.WmiRebootRequired
+
+            [pscustomobject]@{
+                ProbeSucceeded = $true
+                Any = [bool]$any
+                PendingFileRenameOperations = [bool]$state.PendingFileRenameOperations
+                WindowsUpdateRebootRequired = [bool]$state.WindowsUpdateRebootRequired
+                ComponentBasedServicingRebootPending = [bool]$state.ComponentBasedServicingRebootPending
+                WmiRebootRequired = [bool]$state.WmiRebootRequired
+            }
         }
 
-        return [bool]$pendingReboot
+        return $pendingRebootState
     }
     catch {
         Write-Log "Could not determine reboot state for $($Session.ComputerName): $($_.Exception.Message)" -Level WARNING
-        return $false
+        return [pscustomobject]@{
+            ProbeSucceeded = $false
+            Any = $false
+            PendingFileRenameOperations = $false
+            WindowsUpdateRebootRequired = $false
+            ComponentBasedServicingRebootPending = $false
+            WmiRebootRequired = $false
+        }
+    }
+}
+
+function Get-RebootRequirementEvaluation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$InstallerExitCode,
+
+        [Parameter(Mandatory = $true)]
+        [object]$BeforeState,
+
+        [Parameter(Mandatory = $true)]
+        [object]$AfterState
+    )
+
+    $exitCodeRequiresReboot = $InstallerExitCode -in @(1641, 3010)
+    $beforeKnown = [bool]($BeforeState -and $BeforeState.ProbeSucceeded)
+    $afterKnown = [bool]($AfterState -and $AfterState.ProbeSucceeded)
+
+    $newPendingIndicators = $false
+    if ($beforeKnown -and $afterKnown) {
+        $newPendingIndicators =
+            ((-not [bool]$BeforeState.PendingFileRenameOperations) -and [bool]$AfterState.PendingFileRenameOperations) -or
+            ((-not [bool]$BeforeState.WindowsUpdateRebootRequired) -and [bool]$AfterState.WindowsUpdateRebootRequired) -or
+            ((-not [bool]$BeforeState.ComponentBasedServicingRebootPending) -and [bool]$AfterState.ComponentBasedServicingRebootPending) -or
+            ((-not [bool]$BeforeState.WmiRebootRequired) -and [bool]$AfterState.WmiRebootRequired)
+    }
+
+    $installationTriggered = $exitCodeRequiresReboot -or $newPendingIndicators
+    $rebootRequired = $installationTriggered
+
+    $message = if (-not $rebootRequired) {
+        'No reboot is required due to this installation.'
+    }
+    else {
+        'Reboot required due to this installation.'
+    }
+
+    return [pscustomobject]@{
+        RebootRequired = [bool]$rebootRequired
+        Message = $message
     }
 }
 
@@ -1011,6 +1094,8 @@ function Invoke-MachineInstall {
 
         $remoteInstallerPath = Join-Path -Path $RemoteTempPath -ChildPath $InstallerFile.Name
 
+        $preInstallRebootState = Get-PendingRebootState -Session $session
+
         $copySucceeded = Copy-MSIWithRetry -LocalPath $InstallerFile.FullName -RemotePath $remoteInstallerPath -Session $session
         if (-not $copySucceeded) {
             $endTime = Get-Date
@@ -1055,16 +1140,19 @@ function Invoke-MachineInstall {
         Write-Log "[$ComputerName] Installer completed with exit code $exitCode ($desc)." -Level INFO
 
         $success = $exitCode -in @(0, 1641, 3010)
-        $rebootRequired = $exitCode -in @(1641, 3010)
 
         if ($success) {
-            $pendingReboot = Test-PendingReboot -Session $session
-            $rebootRequired = $rebootRequired -or $pendingReboot
+            $postInstallRebootState = Get-PendingRebootState -Session $session
+            $rebootEvaluation = Get-RebootRequirementEvaluation -InstallerExitCode $exitCode -BeforeState $preInstallRebootState -AfterState $postInstallRebootState
+            $rebootRequired = [bool]$rebootEvaluation.RebootRequired
+            $successMessage = "Installation completed successfully. $($rebootEvaluation.Message)"
+
+            Write-Log "[$ComputerName] $($rebootEvaluation.Message)" -Level INFO
 
             Remove-RemoteMSI -Session $session -RemotePath $remoteInstallerPath
 
             $endTime = Get-Date
-            return New-Result -MachineName $ComputerName -Status 'Success' -ExitCode $exitCode -Message 'Installation completed successfully.' -RebootRequired $rebootRequired -Attempt $Attempt -StartTime $startTime -EndTime $endTime
+            return New-Result -MachineName $ComputerName -Status 'Success' -ExitCode $exitCode -Message $successMessage -RebootRequired $rebootRequired -Attempt $Attempt -StartTime $startTime -EndTime $endTime
         }
 
         if ($exitCode -eq 1619) {
@@ -1275,12 +1363,124 @@ function Invoke-Deployment {
                         $session = New-PSSession -ComputerName $machine -ErrorAction Stop
                     }
 
+                    function Get-RebootState {
+                        param([System.Management.Automation.Runspaces.PSSession]$Session)
+
+                        try {
+                            $rebootState = Invoke-Command -Session $Session -ScriptBlock {
+                                $state = [ordered]@{
+                                    PendingFileRenameOperations = $false
+                                    WindowsUpdateRebootRequired = $false
+                                    ComponentBasedServicingRebootPending = $false
+                                    WmiRebootRequired = $false
+                                }
+
+                                try {
+                                    $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+                                    $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+                                    if ($pendingRename -and $pendingRename.PendingFileRenameOperations) {
+                                        $state.PendingFileRenameOperations = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $wuRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+                                    if (Test-Path -Path $wuRebootPath) {
+                                        $state.WindowsUpdateRebootRequired = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $cbsRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+                                    if (Test-Path -Path $cbsRebootPath) {
+                                        $state.ComponentBasedServicingRebootPending = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                                    if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
+                                        $state.WmiRebootRequired = $true
+                                    }
+                                }
+                                catch {}
+
+                                $any = $state.PendingFileRenameOperations -or
+                                    $state.WindowsUpdateRebootRequired -or
+                                    $state.ComponentBasedServicingRebootPending -or
+                                    $state.WmiRebootRequired
+
+                                return [pscustomobject]@{
+                                    ProbeSucceeded = $true
+                                    Any = [bool]$any
+                                    PendingFileRenameOperations = [bool]$state.PendingFileRenameOperations
+                                    WindowsUpdateRebootRequired = [bool]$state.WindowsUpdateRebootRequired
+                                    ComponentBasedServicingRebootPending = [bool]$state.ComponentBasedServicingRebootPending
+                                    WmiRebootRequired = [bool]$state.WmiRebootRequired
+                                }
+                            }
+
+                            return $rebootState
+                        }
+                        catch {
+                            return [pscustomobject]@{
+                                ProbeSucceeded = $false
+                                Any = $false
+                                PendingFileRenameOperations = $false
+                                WindowsUpdateRebootRequired = $false
+                                ComponentBasedServicingRebootPending = $false
+                                WmiRebootRequired = $false
+                            }
+                        }
+                    }
+
+                    function Get-RebootEval {
+                        param(
+                            [int]$InstallerExitCode,
+                            [object]$BeforeState,
+                            [object]$AfterState
+                        )
+
+                        $exitCodeRequiresReboot = $InstallerExitCode -in @(1641, 3010)
+                        $beforeKnown = [bool]($BeforeState -and $BeforeState.ProbeSucceeded)
+                        $afterKnown = [bool]($AfterState -and $AfterState.ProbeSucceeded)
+
+                        $newPendingIndicators = $false
+                        if ($beforeKnown -and $afterKnown) {
+                            $newPendingIndicators =
+                                ((-not [bool]$BeforeState.PendingFileRenameOperations) -and [bool]$AfterState.PendingFileRenameOperations) -or
+                                ((-not [bool]$BeforeState.WindowsUpdateRebootRequired) -and [bool]$AfterState.WindowsUpdateRebootRequired) -or
+                                ((-not [bool]$BeforeState.ComponentBasedServicingRebootPending) -and [bool]$AfterState.ComponentBasedServicingRebootPending) -or
+                                ((-not [bool]$BeforeState.WmiRebootRequired) -and [bool]$AfterState.WmiRebootRequired)
+                        }
+
+                        $installationTriggered = $exitCodeRequiresReboot -or $newPendingIndicators
+                        $rebootRequired = $installationTriggered
+
+                        $message = if (-not $rebootRequired) {
+                            'No reboot is required due to this installation.'
+                        }
+                        else {
+                            'Reboot required due to this installation.'
+                        }
+
+                        return [pscustomobject]@{
+                            RebootRequired = [bool]$rebootRequired
+                            Message = $message
+                        }
+                    }
+
                     Invoke-Command -Session $session -ScriptBlock {
                         param($TempPath)
                         if (-not (Test-Path -Path $TempPath)) {
                             New-Item -Path $TempPath -ItemType Directory -Force | Out-Null
                         }
                     } -ArgumentList $remoteTempPath
+
+                    $preInstallRebootState = Get-RebootState -Session $session
 
                     $remoteInstallerPath = Join-Path -Path $remoteTempPath -ChildPath $installerFile.Name
                     $copied = $false
@@ -1325,28 +1525,14 @@ function Invoke-Deployment {
                     } -ArgumentList $remoteInstallerPath
 
                     $success = $exitCode -in @(0, 1641, 3010)
-                    $rebootRequired = $exitCode -in @(1641, 3010)
+                    $rebootRequired = $false
+                    $successMessage = 'Installation completed successfully.'
 
                     if ($success) {
-                        try {
-                            $pendingReboot = Invoke-Command -Session $session -ScriptBlock {
-                                $requiresReboot = $false
-                                $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-                                $regPath2 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update'
-                                $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-                                if ($pendingRename -and $pendingRename.PendingFileRenameOperations) { $requiresReboot = $true }
-                                $wuReboot = Get-ItemProperty -Path $regPath2 -Name 'RebootRequired' -ErrorAction SilentlyContinue
-                                if ($wuReboot -and $wuReboot.RebootRequired) { $requiresReboot = $true }
-                                try {
-                                    $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-                                    if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) { $requiresReboot = $true }
-                                }
-                                catch {}
-                                return $requiresReboot
-                            }
-                            $rebootRequired = $rebootRequired -or [bool]$pendingReboot
-                        }
-                        catch {}
+                        $postInstallRebootState = Get-RebootState -Session $session
+                        $rebootEval = Get-RebootEval -InstallerExitCode $exitCode -BeforeState $preInstallRebootState -AfterState $postInstallRebootState
+                        $rebootRequired = [bool]$rebootEval.RebootRequired
+                        $successMessage = "Installation completed successfully. $($rebootEval.Message)"
 
                         try {
                             Invoke-Command -Session $session -ScriptBlock {
@@ -1362,7 +1548,7 @@ function Invoke-Deployment {
                             Status          = 'Success'
                             ExitCode        = $exitCode
                             ExitDescription = Get-ExitDesc -Code $exitCode
-                            Message         = 'Installation completed successfully.'
+                            Message         = $successMessage
                             RebootRequired  = $rebootRequired
                             Attempt         = $attempt
                             StartTime       = $startTime
