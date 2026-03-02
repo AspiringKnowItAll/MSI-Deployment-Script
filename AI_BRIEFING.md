@@ -2,27 +2,34 @@
 
 ## Quick Context
 
-This is a production PowerShell script (`Install-RemoteMSI.ps1`) located at `c:\Programs\Script\` that remotely installs MSI packages on Windows machines with comprehensive error handling, credential management, reboot detection, and logging.
+This is a production PowerShell script (`Install-RemoteMSI.ps1`) that remotely installs MSI/MSIX packages on Windows machines with comprehensive error handling, credential management, reboot detection, batch handling, and logging.
 
 **Owner**: Andrew Lucas  
-**Last Modified**: February 26, 2026  
+**Last Modified**: March 2, 2026  
 **PowerShell Version Required**: 5.1+
 
 ---
 
 ## What This Script Does
 
-The script performs **silent remote MSI installation** on a single networked machine with full workflow:
+The script performs **silent remote MSI/MSIX installation** with two operator modes:
 
-1. **Validates hostname** against Active Directory/DNS
-2. **Checks connectivity** (privilege-aware - ICMP for admins, TCP 5985 for non-admins)
-3. **Prompts for MSI/MSIX selection** (discovers in script directory)
-4. **Handles credentials** (tests current user first, prompts if needed)
-5. **Copies MSI** to remote machine via PSSession
-6. **Executes silent installation** (msiexec /quiet /norestart)
-7. **Detects if reboot is required** (registry + WMI hybrid approach)
-8. **Cleans up** (removes MSI on success, preserves on failure)
-9. **Logs everything** (console + timestamped file with outcome indicator)
+1. **Single-machine mode** (interactive hostname input)
+2. **Batch mode** (CSV/TXT machine list discovery and parsing)
+
+Core workflow:
+
+1. **Validates credentials first** using a probe machine
+2. **Sanitizes hostnames** before validation/use
+3. **Validates machine candidates** against AD/DNS and online status (batch pre-validation)
+4. **Prompts for installer selection** from script directory
+5. **Copies installer with retry policy** (5s/10s/30s/60s)
+6. **Executes silent installation** (`msiexec /quiet /norestart`)
+7. **Maps MSI exit codes** to human-readable meaning
+8. **Handles retries per failed machine only** after each batch finishes
+9. **Preserves MSI on non-corruption failures** for later retries
+10. **Aggregates all activity into one run log file**
+11. **Comments successful machines in source file** for rerun skip behavior
 
 ---
 
@@ -35,7 +42,7 @@ $LocalMSIPath = $ScriptDirectory  # MSI/MSIX folder (same as script directory)
 $RemoteTempPath = 'C:\Temp'              # Where MSI is copied on remote machine
 $LogDirectory = Join-Path -Path $ScriptDirectory -ChildPath 'Logs'  # Logs folder next to script
 $MaxCredentialAttempts = 2               # Failed login attempts before abort
-$LogPath = $null                         # Set dynamically after hostname known
+$RunLogPath = <optional>                 # Reused during PS5→PS7 relaunch to keep one aggregated log
 ```
 
 ### Main Functions (Know These)
@@ -46,13 +53,25 @@ $LogPath = $null                         # Set dynamically after hostname known
 | `Test-InstallerFilesExist` | Verifies MSI/MSIX files exist in script directory before proceeding |
 | `Test-ComputerInAD` | Validates hostname exists via DNS/AD |
 | `Test-ComputerOnline` | Tests connectivity via TCP 5985 or ICMP (privilege-aware) |
-| `Get-ValidatedHostname` | Prompts user for hostname with validation loop |
+| `Get-ValidatedSingleHostname` | Prompts user for hostname and sanitizes input |
 | `Request-Credentials` | Prompts user for credentials using terminal `Read-Host` (no GUI dialog) |
+| `Get-ValidatedCredentialForProbe` | Validates credentials first, before heavy processing |
+| `Find-BatchMachineFile` | Discovers CSV/TXT machine file in script directory or accepts alternate path |
+| `Get-MachineNamesFromFile` | Parses first column/no-header file and sanitizes hostnames |
+| `Get-ValidatedBatchMachines` | AD + online pre-validation for batch execution list |
+| `Copy-MSIWithRetry` | Applies transfer retry delays (5/10/30/60) then prompts retry/abort |
+| `Invoke-Deployment` | Executes batches with retry rounds on failed machines only |
+| `Update-BatchFileForSuccesses` | Comments successful machine rows in source list |
+| `Get-InstallerFiles` | Enumerates MSI/MSIX files in script directory with extension filtering |
 | `Get-MSIFile` | Finds MSI and MSIX files in script directory, prompts if multiple |
-| `Install-RemoteMSI` | Executes msiexec on remote machine, returns exit code |
+| `Get-PowerShell7Details` | Detects local PS7 from command, common install paths, and App Paths registry |
+| `Install-PowerShell7ViaWindowsUpdate` | Optional WSUS/Microsoft Update-based PS7 install path |
+| `Invoke-PowerShell7Relaunch` | Relaunches script in `pwsh` and reuses same run log path |
+| `Invoke-PowerShell7Bootstrap` | Startup runtime gate before normal prompts |
+| `Read-RetryChoice` | Prompt for retry/skip/abort for failed machines |
 | `Test-PendingReboot` | Checks registry + WMI for reboot requirements |
-| `Remove-RemoteFile` | Deletes MSI from remote machine |
-| `Main` | Orchestrates entire 10-phase workflow |
+| `Remove-RemoteMSI` | Deletes MSI from remote machine |
+| `Main` | Orchestrates single or batch workflow |
 
 ### Script Phases
 
@@ -60,35 +79,38 @@ $LogPath = $null                         # Set dynamically after hostname known
 PHASE 0: INSTALLER FILE VERIFICATION
   └─ Verifies MSI/MSIX files exist in script directory, exits with helpful message if not
 
-PHASE 1: INPUT VALIDATION
-  └─ Gets hostname via Get-ValidatedHostname (AD/DNS check)
+PHASE 1: MODE + TARGET SOURCE SELECTION
+  └─ Select Single or Batch mode, collect hostname or machine list file
 
-PHASE 1.5: CONNECTIVITY CHECK (non-blocking for non-admins)
-  └─ Tests if machine reachable (skipped if non-admin)
+PHASE 2: CREDENTIAL VALIDATION (FIRST)
+  └─ Validate once against probe machine before full list validation/execution
 
-PHASE 2: MSI/MSIX SELECTION
+PHASE 3: MACHINE SANITIZATION + VALIDATION
+  └─ Single: sanitize hostname
+  └─ Batch: sanitize all names, then pre-validate AD/DNS + online
+
+PHASE 4: MSI/MSIX SELECTION
   └─ User chooses from MSI/MSIX files in script directory
 
-PHASE 3: CREDENTIAL HANDLING
-  └─ Tests current user, prompts if insufficient permissions
-
-PHASE 4: REMOTE SESSION CREATION
+PHASE 5: REMOTE SESSION CREATION
   └─ Creates PSSession to target machine
 
-PHASE 5: REMOTE ENVIRONMENT PREP
+PHASE 6: REMOTE ENVIRONMENT PREP
   └─ Ensures C:\Temp exists on remote machine
 
-PHASE 6: MSI COPY
-  └─ Copy-Item to remote machine via PSSession
+PHASE 7: MSI COPY WITH RETRIES
+  └─ Copy-Item to remote machine via PSSession, delay sequence 5/10/30/60
 
-PHASE 7: INSTALLATION EXECUTION
+PHASE 8: INSTALLATION EXECUTION
   └─ msiexec /quiet /norestart, captures exit code
 
-PHASE 8: REBOOT DETECTION
+PHASE 9: REBOOT DETECTION
   └─ Registry + WMI checks for pending reboot
 
-PHASE 9: CLEANUP & LOGGING
-  └─ Remove MSI (success) or keep (failure), rename log file
+PHASE 10: CLEANUP, RETRIES, AND LOGGING
+  └─ Remove MSI on success (or corruption error), keep on other failures
+  └─ Retry failed machines only after batch completion
+  └─ Append aggregated run summary to one log file
 ```
 
 ### Exit Codes
@@ -98,8 +120,66 @@ PHASE 9: CLEANUP & LOGGING
 
 ### Logging
 - **Console**: Color-coded (GREEN=success, RED=error, YELLOW=warning, CYAN=info)
-- **File**: `Logs\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log` (folder created automatically next to script)
+- **File**: `Logs\Deployment_[yyyyMMdd_HHmmss].log` (one log file per script run)
 - **Timestamps**: Every message logged with `yyyy-MM-dd HH:mm:ss`
+
+---
+
+## Decision Log (March 2, 2026)
+
+These are hard requirements and operator preferences that must be preserved in future edits:
+
+1. **Credential validation must happen first**
+  - Validate credentials before full machine-list validation/building work.
+  - Rationale: avoid spending time preparing batch lists when credentials are invalid.
+
+2. **Credential input method is terminal-based `Read-Host` only**
+  - No GUI credential dialogs.
+  - Rationale: GUI popups were unreliable in prior runs; terminal prompts are deterministic.
+
+3. **Single-machine mode also requires hostname sanitization**
+  - Rationale: keep parity with batch sanitization and avoid malformed input.
+
+4. **Batch file rules**
+  - Scan script directory first for CSV/TXT candidates.
+  - Prompt to use detected file or provide alternate path.
+  - Parse first column only; do not assume header row.
+
+5. **Batch validation boundaries**
+  - Pre-validate AD/DNS and online status before execution.
+  - Execution workers should not redo those list-building validations.
+
+6. **Transfer retry policy**
+  - Fixed delay sequence: 5s, 10s, 30s, 60s.
+  - Then prompt operator to retry transfer cycle or abort.
+
+7. **Failure handling scope**
+  - A failure on one machine must not pause other machines in the same batch.
+  - After batch completes, retry prompts apply only to failed machine(s).
+  - Include attempt count, error code, and human-readable reason in prompt.
+
+8. **MSI retention policy**
+  - Keep MSI on remote machine for failures that are not corruption/package-open errors.
+  - Remove MSI on success.
+
+9. **Rerun behavior through source file mutation**
+  - Comment out successful machines in source CSV/TXT so next script run skips them.
+  - Rationale: avoid reprocessing machines already upgraded.
+
+10. **Documentation discipline for agents**
+   - Update this briefing with decisions/preferences and rationale when planning/behavior changes.
+   - If a new requirement conflicts with previous decisions, explicitly surface the conflict to the user.
+
+11. **PowerShell 7 startup runtime gate**
+  - Script must check host/runtime at startup before normal operator prompts.
+  - If running in non-PS7 host and `pwsh` 7+ is present, prompt to relaunch in `pwsh` (default = relaunch).
+  - If operator declines relaunch, continue run with sequential fallback where parallel is requested.
+
+12. **PowerShell 7 install option when missing**
+  - If `pwsh` 7+ is not present and run is interactive, offer optional install attempt via configured Windows Update service (WSUS/Microsoft Update policy path).
+  - If `pwsh` 7+ is already installed, skip installation path entirely.
+  - If install attempt cannot find approved/applicable update or fails, do not fail deployment; continue with sequential fallback.
+  - In non-interactive/unattended runs, skip install attempt and continue sequential fallback.
 
 ---
 
@@ -119,7 +199,7 @@ PHASE 9: CLEANUP & LOGGING
 **Why**: Only real way to know if credentials work on the remote machine
 
 **How it works**:
-- `Get-SessionCredentials` creates a test `New-PSSession` and additionally checks the remote session for local administrator membership
+- `Get-ValidatedCredentialForProbe` creates a test `New-PSSession` and additionally checks the remote session for local administrator membership
 - If successful and admin, credentials are valid
 - Retry loop (max 2 attempts) for incorrect password entry
 - If current account can connect but isn’t admin, user is prompted right away
@@ -169,9 +249,9 @@ PHASE 9: CLEANUP & LOGGING
 **Fix**: Already implemented - moved connectivity check to after hostname validation, skipped for non-admin users  
 **Code Location**: Lines ~513-525 in Main function
 
-### Issue: Credentials prompting failing with "Current user has access" when they don't
-**Root Cause**: Test PSSession creation succeeds with default context but fails during actual install  
-**Fix**: Gets credentials via `Get-SessionCredentials → Get-ValidatedCredentials` with PSSession test
+### Issue: Credentials validate initially but fail later during install
+**Root Cause**: Probe checks can differ from later remote operations if privileges are insufficient  
+**Fix**: `Get-ValidatedCredentialForProbe` validates session and remote admin role before deployment steps
 
 ### Issue: Running script by double-click never shows credential prompt (no GUI)
 **Root Cause**: When PowerShell is started fresh from Explorer, a GUI credential dialog may not render or may not be interactive. We simplified by using terminal prompts exclusively.
@@ -183,7 +263,7 @@ PHASE 9: CLEANUP & LOGGING
 **Fix**: Hybrid method (registry + WMI) catches edge cases
 
 ### Issue: MSI stays on remote machine even after success
-**Root Cause**: `Remove-RemoteFile` has error, but installation succeeded  
+**Root Cause**: `Remove-RemoteMSI` has error, but installation succeeded  
 **Solution**: Non-blocking error - installation succeeded, just verify cleanup manually
 
 ---
@@ -244,7 +324,7 @@ Before deployment or modification, verify:
 **Code**: Deleted `$InstallTimeout = 300` from configuration  
 
 **Issue 4**: Script would silently connect with non‑admin credentials when launched from Explorer, then fail later during installation without ever prompting the user.  
-**Solution**: `Get-SessionCredentials` now verifies remote admin membership and forces a credential prompt if the current account cannot perform the required operations.  
+**Solution**: `Get-ValidatedCredentialForProbe` now verifies remote admin membership and forces a credential prompt if the current account cannot perform the required operations.  
 **Code**: Updated function implementation earlier in this briefing
 
 **Issue 3**: Better reboot detection needed  
@@ -257,7 +337,7 @@ Before deployment or modification, verify:
 
 ✅ **Built-in PowerShell Cmdlets** (No external modules required):
 - `New-PSSession` / `Remove-PSSession` / `Invoke-Command` (remoting)
-- `Get-Credential` (credential UIHandling)
+- `Read-Host` / `Read-Host -AsSecureString` (credential input handling)
 - `Copy-Item` (file transfer)
 - `Test-Connection` (connectivity)
 - `Resolve-DnsName` (DNS validation)
@@ -287,7 +367,7 @@ c:\Programs\Script\Logs\[ComputerName]_[timestamp]_*.log ← Generated log files
 ## Getting Help on Specific Areas
 
 - **Understanding remoting**: Read `Invoke-Command` and `New-PSSession` in `Get-Help`
-- **Credential handling**: See `Get-SessionCredentials` and `Get-ValidatedCredentials` functions
+- **Credential handling**: See `Request-Credentials` and `Get-ValidatedCredentialForProbe` functions
 - **Logging strategy**: Review `Write-Log` function
 - **Reboot detection**: Study `Test-PendingReboot` function
 - **Error flow**: Trace through `Main` function phase-by-phase
