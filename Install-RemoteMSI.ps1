@@ -1,30 +1,25 @@
 <#
 .SYNOPSIS
-    Remotely installs an MSI package on a remote machine with error handling and reboot detection.
+    Remotely installs an MSI/MSIX package on one or more remote Windows machines.
 
 .DESCRIPTION
-    This script allows silent installation of an MSI file on a remote machine. It:
-    - Prompts for hostname and validates against Active Directory
-    - Checks if remote machine is online  
-    - Handles credential authentication with retry logic
-    - Copies MSI to remote machine
-    - Executes silent installation with no restart
-    - Monitors installation status
-    - Detects if reboot is required (registry + WMI)
-    - Removes MSI on success, preserves on failure
-    - Logs all operations to timestamped file with success/failure indicator
-    - Provides detailed terminal and file output
-
-.NOTES
-    Author: Andrew Lucas using Claude Haiku 4.5 in VSCode Chat
-    Requires: Administrator privileges for remote execution
-    Credential Security: PSCredential uses SecureString (in-memory only, never written to disk)
-    MSI Source: C:\Downloads\
-    Log Location: C:\Downloads\[ComputerName]_[yyyyMMdd_HHmmss]_[Success|Failure|Incomplete].log
+    Supports single-machine and batch execution with:
+    - Credential validation before heavy processing
+    - Hostname sanitization
+    - Batch input file discovery (CSV/TXT)
+    - AD and online pre-validation for batch lists
+    - Throttled parallel installation batches
+    - File transfer retry policy (5s, 10s, 30s, 60s)
+    - Per-machine retry rounds after each batch (failed machines only)
+    - One aggregated log file per script run
+    - In-place success commenting in source machine file for reruns
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$NonInteractive,
+    [string]$RunLogPath
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -36,22 +31,44 @@ $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LocalMSIPath = $ScriptDirectory
 $RemoteTempPath = 'C:\Temp'
 $LogDirectory = Join-Path -Path $ScriptDirectory -ChildPath 'Logs'
-$LogPath = $null  # Will be set after hostname is known
 $MaxCredentialAttempts = 2
+$TransferRetryDelays = @(5, 10, 30, 60)
+$LogPath = $null
+$RunId = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 
 # ============================================================================
-# LOGGING FUNCTION
+# LOGGING
 # ============================================================================
+
+function Initialize-RunLog {
+    if (-not (Test-Path -Path $LogDirectory)) {
+        New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RunLogPath)) {
+        $resolvedPath = $RunLogPath
+        $resolvedDirectory = Split-Path -Path $resolvedPath -Parent
+        if ($resolvedDirectory -and -not (Test-Path -Path $resolvedDirectory)) {
+            New-Item -ItemType Directory -Path $resolvedDirectory -Force | Out-Null
+        }
+
+        $script:LogPath = $resolvedPath
+        if (-not (Test-Path -Path $script:LogPath -PathType Leaf)) {
+            New-Item -Path $script:LogPath -ItemType File -Force | Out-Null
+        }
+        return
+    }
+
+    $script:LogPath = Join-Path -Path $LogDirectory -ChildPath "Deployment_$RunId.log"
+    New-Item -Path $script:LogPath -ItemType File -Force | Out-Null
+}
 
 function Write-Log {
-    <#
-    .SYNOPSIS
-        Writes messages to both console and log file with timestamps and log levels.
-    #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$Message,
-        
+
         [Parameter(Mandatory = $false)]
         [ValidateSet('INFO', 'SUCCESS', 'ERROR', 'WARNING')]
         [string]$Level = 'INFO'
@@ -59,785 +76,1846 @@ function Write-Log {
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logMessage = "$timestamp [$Level] $Message"
-    
-    # Write to console with colors
+
     $color = switch ($Level) {
         'SUCCESS' { 'Green' }
         'ERROR' { 'Red' }
         'WARNING' { 'Yellow' }
-        'INFO' { 'Cyan' }
+        default { 'Cyan' }
     }
+
     Write-Host $logMessage -ForegroundColor $color
-    
-    # Write to log file if it exists
-    if ($LogPath -and (Test-Path -Path (Split-Path -Parent $LogPath))) {
-        Add-Content -Path $LogPath -Value $logMessage -Encoding UTF8
+
+    if ($script:LogPath) {
+        Add-Content -Path $script:LogPath -Value $logMessage -Encoding UTF8
     }
 }
 
 # ============================================================================
-# VALIDATION FUNCTIONS
+# INPUT / VALIDATION HELPERS
 # ============================================================================
 
+function Get-Confirmation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    while ($true) {
+        $response = (Read-Host "$Prompt [Y/N]").Trim().ToUpperInvariant()
+        if ($response -in @('Y', 'YES')) { return $true }
+        if ($response -in @('N', 'NO')) { return $false }
+        Write-Log "Please enter Y or N." -Level WARNING
+    }
+}
+
+function ConvertTo-Hostname {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RawName
+    )
+
+    $trimmed = $RawName.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $null
+    }
+
+    $cleaned = ($trimmed -replace '[^a-zA-Z0-9\-\._]', '')
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        return $null
+    }
+
+    return $cleaned
+}
+
 function Test-ComputerInAD {
-    <#
-    .SYNOPSIS
-        Validates that a computer exists in Active Directory and is online.
-    #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$ComputerName
     )
 
     try {
-        Write-Log "Validating computer '$ComputerName' against Active Directory..." -Level INFO
-        
-        # Try to resolve the hostname
-        $dnsResolve = Resolve-DnsName -Name $ComputerName -ErrorAction SilentlyContinue
-        if (-not $dnsResolve) {
-            Write-Log "Computer '$ComputerName' not found in DNS." -Level ERROR
+        if (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue) {
+            $adComputer = Get-ADComputer -Identity $ComputerName -ErrorAction SilentlyContinue
+            if ($adComputer) {
+                return $true
+            }
             return $false
         }
 
-        Write-Log "Computer '$ComputerName' found in DNS." -Level SUCCESS
-        return $true
+        Write-Log "ActiveDirectory module not available. Falling back to DNS validation for '$ComputerName'." -Level WARNING
+        $dnsResolve = Resolve-DnsName -Name $ComputerName -ErrorAction SilentlyContinue
+        return [bool]$dnsResolve
     }
     catch {
-        Write-Log "Error validating computer: $($_.Exception.Message)" -Level ERROR
         return $false
     }
 }
 
 function Test-ComputerOnline {
-    <#
-    .SYNOPSIS
-        Tests if a remote computer is online and reachable.
-        Uses multiple methods to work with non-admin user context.
-    #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$ComputerName
     )
 
     try {
-        Write-Log "Testing connectivity to '$ComputerName'..." -Level INFO
-        
-        # Method 1: Try TCP connection to WinRM port (no admin required, better for remoting)
         try {
-            Write-Log "Attempting TCP connection to WinRM port (5985)..." -Level INFO
             $tcpTest = Test-Connection -TargetName $ComputerName -TcpPort 5985 -Quiet -Count 1 -TimeoutSeconds 5
-            
-            if ($tcpTest) {
-                Write-Log "Computer '$ComputerName' is online (TCP/5985 responding)." -Level SUCCESS
-                return $true
-            }
+            if ($tcpTest) { return $true }
         }
         catch {
-            Write-Log "TCP port test not available (requires PS 7+), attempting ICMP..." -Level INFO
+            # ignore and fallback
         }
 
-        # Method 2: Try ICMP ping (may require admin on Windows)
-        try {
-            $ping = Test-Connection -TargetName $ComputerName -Quiet -Count 1 -TimeoutSeconds 5
-            
-            if ($ping) {
-                Write-Log "Computer '$ComputerName' is online (ICMP responding)." -Level SUCCESS
-                return $true
-            }
-            else {
-                Write-Log "Computer '$ComputerName' is not responding to connectivity tests." -Level ERROR
-                return $false
-            }
-        }
-        catch {
-            Write-Log "ICMP test failed: $($_.Exception.Message)" -Level WARNING
-            Write-Log "Note: ICMP/ping may require administrator privileges on this system." -Level WARNING
-            return $false
-        }
+        $ping = Test-Connection -TargetName $ComputerName -Quiet -Count 1 -TimeoutSeconds 5
+        return [bool]$ping
     }
     catch {
-        Write-Log "Error testing connectivity: $($_.Exception.Message)" -Level ERROR
         return $false
     }
 }
 
-function Get-ValidatedHostname {
-    <#
-    .SYNOPSIS
-        Prompts user for hostname and validates it against AD.
-        Online check deferred to after privilege verification.
-    #>
-    
-    Write-Host "`n" + ("=" * 70)
-    Write-Host "Remote MSI Installation Tool" -ForegroundColor Cyan
-    Write-Host ("=" * 70)
-    
+function Get-ValidatedSingleHostname {
     while ($true) {
-        $hostname = Read-Host "`nEnter the hostname of the target machine"
-        
-        if ([string]::IsNullOrWhiteSpace($hostname)) {
-            Write-Log "Hostname cannot be empty." -Level WARNING
+        $rawHost = Read-Host "Enter the hostname of the target machine"
+        $hostName = ConvertTo-Hostname -RawName $rawHost
+
+        if (-not $hostName) {
+            Write-Log "Hostname is empty or contains only invalid characters." -Level WARNING
             continue
         }
 
-        if (-not (Test-ComputerInAD -ComputerName $hostname)) {
-            Write-Log "Please enter a valid hostname." -Level WARNING
-            continue
+        if ($hostName -ne $rawHost.Trim()) {
+            Write-Log "Hostname sanitized to '$hostName'." -Level INFO
         }
 
-        Write-Log "Hostname validation successful." -Level SUCCESS
-        return $hostname
+        return $hostName
     }
 }
 
-# ============================================================================
-# CREDENTIAL HANDLING
-# ============================================================================
+function Get-ExecutionMode {
+    Write-Host "`n" + ('=' * 70)
+    Write-Host 'Remote MSI Installation Tool' -ForegroundColor Cyan
+    Write-Host ('=' * 70)
+    Write-Host '[1] Single Machine'
+    Write-Host '[2] Batch Deployment (CSV/TXT)'
 
-function Request-Credentials {
-    <#
-    .SYNOPSIS
-        Prompts the user for credentials using console Read-Host.
-        No GUI dialog - guaranteed to work whether run in terminal or
-        when launched by double-clicking from Explorer. Password is
-        encrypted as SecureString in memory (just as secure as Get-Credential).
-    .PARAMETER Message
-        Optional message to display before prompts.
-    #>
-    param(
-        [string]$Message = "Enter credentials"
-    )
-
-    Write-Host $Message -ForegroundColor Cyan
-    $user = Read-Host "User"
-    if ([string]::IsNullOrWhiteSpace($user)) {
-        return $null
+    while ($true) {
+        $selection = (Read-Host "Select mode [1-2]").Trim()
+        if ($selection -eq '1') { return 'Single' }
+        if ($selection -eq '2') { return 'Batch' }
+        Write-Log 'Invalid selection. Enter 1 or 2.' -Level WARNING
     }
-    $pass = Read-Host "Password" -AsSecureString
-    if ($null -eq $pass) {
-        return $null
-    }
-    return New-Object System.Management.Automation.PSCredential($user, $pass)
 }
 
-function Get-ValidatedCredentials {
-    <#
-    .SYNOPSIS
-        Attempts to get validated credentials from user with retry logic.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ComputerName,
-        
-        [Parameter(Mandatory = $true)]
-        [pscredential]$InitialCredential
-    )
-
-    $domain = (Get-ADDomain -ErrorAction SilentlyContinue).DNSRoot
-    if (-not $domain) {
-        $domain = $env:USERDOMAIN
+function Get-PowerShell7Details {
+    $details = [pscustomobject]@{
+        Available    = $false
+        Path         = $null
+        MajorVersion = 0
     }
 
-    $attemptCount = 0
-    
-    while ($attemptCount -lt $MaxCredentialAttempts) {
-        try {
-            Write-Log "Attempting to validate credentials (Attempt $($attemptCount + 1) of $MaxCredentialAttempts)..." -Level INFO
-            
-            # Test PSSession creation with the credentials
-            $testSession = New-PSSession -ComputerName $ComputerName -Credential $InitialCredential -ErrorAction Stop
-            Remove-PSSession -Session $testSession -ErrorAction SilentlyContinue
-            
-            Write-Log "Credentials validated successfully." -Level SUCCESS
-            return $InitialCredential
-        }
-        catch {
-            $attemptCount++
-            
-            if ($attemptCount -ge $MaxCredentialAttempts) {
-                Write-Log "Failed to validate credentials after $MaxCredentialAttempts attempts." -Level ERROR
-                return $null
-            }
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
 
-            Write-Log "Credentials validation failed: $($_.Exception.Message)" -Level WARNING
-            Write-Log "Prompting for new credentials..." -Level INFO
-            
-            $InitialCredential = Request-Credentials -Message "Enter credentials for $domain"
-            if ($null -eq $InitialCredential) {
-                Write-Log "Credential entry cancelled by user." -Level ERROR
-                return $null
-            }
+    function Add-CandidatePath {
+        param([string]$Path)
+
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return
+        }
+
+        $normalized = $Path.Trim()
+        $key = $normalized.ToUpperInvariant()
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $candidatePaths.Add($normalized)
         }
     }
 
-    return $null
-}
-
-function Get-SessionCredentials {
-    <#
-    .SYNOPSIS
-        Determines if current user credentials work, or prompts for new ones.
-        Additionally verifies that the current identity has local administrator
-        rights on the remote machine so that later installation operations will
-        succeed.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ComputerName
-    )
-
-    Write-Log "Checking if current user can access remote machine..." -Level INFO
-    
     try {
-        # establish a temporary session to test connectivity
-        $testSession = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
-
-        # verify administrative privilege over the session
-        $isAdmin = Invoke-Command -Session $testSession -ScriptBlock {
-            $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-            $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $pwshCommand = Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
+        if ($pwshCommand -and $pwshCommand.Source) {
+            Add-CandidatePath -Path $pwshCommand.Source
         }
-
-        Remove-PSSession -Session $testSession -ErrorAction SilentlyContinue
-
-        if ($isAdmin) {
-            Write-Log "Current user has administrative access to the remote machine." -Level SUCCESS
-            return $null  # use current user credentials
-        }
-
-        # if we can connect but are not admin, we need different creds
-        Write-Log "Connected as non-administrator on remote machine." -Level WARNING
-        Write-Log "Administrator credentials are required." -Level INFO
-        $credential = Request-Credentials -Message "Administrator credentials required for $ComputerName"
-        if ($null -eq $credential) {
-            Write-Log "Credential entry cancelled by user." -Level ERROR
-            return $null
-        }
-        return Get-ValidatedCredentials -ComputerName $ComputerName -InitialCredential $credential
     }
     catch {
-        # failed to connect with current user; prompt for credentials
-        Write-Log "Unable to connect using current user: $($_.Exception.Message)" -Level WARNING
-        Write-Log "Please provide credentials to authenticate." -Level INFO
+        # ignore and continue candidate discovery
+    }
 
-        $credential = Request-Credentials -Message "Credentials required for $ComputerName"
-        if ($null -eq $credential) {
-            Write-Log "Credential entry cancelled by user." -Level ERROR
-            return $null
+    if ($env:ProgramFiles) {
+        Add-CandidatePath -Path (Join-Path -Path ${env:ProgramFiles} -ChildPath 'PowerShell\7\pwsh.exe')
+    }
+
+    if ($env:ProgramW6432) {
+        Add-CandidatePath -Path (Join-Path -Path ${env:ProgramW6432} -ChildPath 'PowerShell\7\pwsh.exe')
+    }
+
+    if (${env:ProgramFiles(x86)}) {
+        Add-CandidatePath -Path (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'PowerShell\7\pwsh.exe')
+    }
+
+    foreach ($registryPath in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\pwsh.exe'
+    )) {
+        try {
+            if (-not (Test-Path -Path $registryPath)) {
+                continue
+            }
+
+            $regItem = Get-Item -Path $registryPath -ErrorAction SilentlyContinue
+            if ($regItem) {
+                $regPwshPath = $regItem.GetValue('')
+                if ($regPwshPath) {
+                    Add-CandidatePath -Path $regPwshPath
+                }
+            }
         }
-        return Get-ValidatedCredentials -ComputerName $ComputerName -InitialCredential $credential
+        catch {
+            # ignore registry read failures
+        }
+    }
+
+    foreach ($candidate in $candidatePaths) {
+        try {
+            if (-not (Test-Path -Path $candidate -PathType Leaf)) {
+                continue
+            }
+
+            $majorVersionOutput = & $candidate -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' 2>$null
+            $majorVersionText = ($majorVersionOutput | Select-Object -First 1).ToString().Trim()
+
+            $majorVersion = 0
+            if (-not [int]::TryParse($majorVersionText, [ref]$majorVersion)) {
+                continue
+            }
+
+            if ($majorVersion -gt $details.MajorVersion) {
+                $details.MajorVersion = $majorVersion
+                $details.Path = $candidate
+            }
+
+            if ($majorVersion -ge 7) {
+                $details.Available = $true
+                $details.Path = $candidate
+                $details.MajorVersion = $majorVersion
+                return $details
+            }
+        }
+        catch {
+            # ignore candidate execution failures
+        }
+    }
+
+    return $details
+}
+
+function Test-IsInteractiveSession {
+    if ($NonInteractive) {
+        return $false
+    }
+
+    return [Environment]::UserInteractive -and $Host.Name -ne 'ServerRemoteHost'
+}
+
+function Test-IsLocalAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
     }
 }
 
-# ============================================================================
-# MSI FILE SELECTION
-# ============================================================================
+function Read-YesNoChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
 
-function Test-InstallerFilesExist {
-    <#
-    .SYNOPSIS
-        Verifies that at least one MSI or MSIX file exists in the script directory.
-        Exits with helpful message if none found.
-    #>
-    
-    if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
-        Write-Host "`n" + ("=" * 70) -ForegroundColor Red
-        Write-Host "ERROR: Script Directory Not Found" -ForegroundColor Red
-        Write-Host ("=" * 70)
-        Write-Host "The script directory does not exist:`n  $LocalMSIPath" -ForegroundColor Yellow
-        Write-Host "`nPress Enter to exit..."
-        Read-Host | Out-Null
-        exit 1
+        [Parameter(Mandatory = $false)]
+        [bool]$DefaultYes = $true
+    )
+
+    $suffix = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $response = (Read-Host "$Prompt $suffix").Trim().ToUpperInvariant()
+
+        if ([string]::IsNullOrWhiteSpace($response)) {
+            return $DefaultYes
+        }
+
+        if ($response -in @('Y', 'YES')) { return $true }
+        if ($response -in @('N', 'NO')) { return $false }
+
+        Write-Log 'Please enter Y or N.' -Level WARNING
+    }
+}
+
+function Install-PowerShell7ViaWindowsUpdate {
+    $result = [pscustomobject]@{
+        Success        = $false
+        Message        = ''
+        RebootRequired = $false
+        InstalledCount = 0
     }
 
-    $msiFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msi' -ErrorAction SilentlyContinue)
-    $msixFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msix' -ErrorAction SilentlyContinue)
-    $allInstallerFiles = @($msiFiles) + @($msixFiles)
-    
+    if (-not (Test-IsLocalAdministrator)) {
+        $result.Message = 'PowerShell 7 install via Windows Update requires running this script as local administrator.'
+        return $result
+    }
+
+    try {
+        $updateSession = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $updateSession.CreateUpdateSearcher()
+        $searchResult = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+
+        $candidates = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($update in $searchResult.Updates) {
+            $title = [string]$update.Title
+            if ($title -match '(?i)PowerShell' -and $title -match '(?i)\b7(\.\d+)?\b') {
+                if (-not $update.EulaAccepted) {
+                    $update.AcceptEula()
+                }
+                [void]$candidates.Add($update)
+            }
+        }
+
+        if ($candidates.Count -eq 0) {
+            $result.Message = 'No approved/applicable PowerShell 7 updates were found from the configured Windows Update service.'
+            return $result
+        }
+
+        $downloader = $updateSession.CreateUpdateDownloader()
+        $downloader.Updates = $candidates
+        $downloadResult = $downloader.Download()
+        if ($downloadResult.ResultCode -notin 2, 3) {
+            $result.Message = "PowerShell 7 update download did not succeed (ResultCode=$($downloadResult.ResultCode))."
+            return $result
+        }
+
+        $installer = $updateSession.CreateUpdateInstaller()
+        $installer.Updates = $candidates
+        $installResult = $installer.Install()
+
+        $installedCount = 0
+        for ($i = 0; $i -lt $candidates.Count; $i++) {
+            $updateResultCode = $installResult.GetUpdateResult($i).ResultCode
+            if ($updateResultCode -in 2, 3) {
+                $installedCount++
+            }
+        }
+
+        $result.InstalledCount = $installedCount
+        $result.RebootRequired = [bool]$installResult.RebootRequired
+        $result.Success = $installedCount -gt 0
+
+        if ($result.Success) {
+            $result.Message = "Installed $installedCount PowerShell update(s) through configured Windows Update service."
+        }
+        else {
+            $result.Message = "PowerShell update install returned no successful updates (ResultCode=$($installResult.ResultCode))."
+        }
+
+        return $result
+    }
+    catch {
+        $result.Message = "Windows Update install attempt failed: $($_.Exception.Message)"
+        return $result
+    }
+}
+
+function Invoke-PowerShell7Relaunch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PwshPath
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($PwshPath) -or -not (Test-Path -LiteralPath $PwshPath -PathType Leaf)) {
+            throw "PowerShell 7 executable path is invalid: '$PwshPath'"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ScriptPath) -or -not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+            throw "Script path for relaunch is invalid: '$ScriptPath'"
+        }
+
+        $launchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)
+        if ($script:LogPath) {
+            $launchArgs += @('-RunLogPath', $script:LogPath)
+        }
+        if ($NonInteractive) {
+            $launchArgs += '-NonInteractive'
+        }
+
+        Write-Log "Launching PowerShell 7 process: '$PwshPath' (same console)." -Level INFO
+        $childProcess = Start-Process -FilePath $PwshPath -ArgumentList $launchArgs -WorkingDirectory $ScriptDirectory -NoNewWindow -PassThru -Wait -ErrorAction Stop
+        if ($null -eq $childProcess) {
+            throw 'PowerShell 7 process failed to start.'
+        }
+
+        Write-Log "PowerShell 7 process exited with code $($childProcess.ExitCode)." -Level INFO
+        if ($childProcess.ExitCode -ne 0) {
+            Write-Log 'PowerShell 7 run ended with non-zero exit code. Check the latest child run log in Logs\Deployment_*.log for the exact failure reason.' -Level WARNING
+        }
+        return [int]$childProcess.ExitCode
+    }
+    catch {
+        Write-Log "Failed to relaunch in PowerShell 7+: $($_.Exception.Message)" -Level ERROR
+        return $null
+    }
+}
+
+function Invoke-PowerShell7Bootstrap {
+    $currentMajor = $PSVersionTable.PSVersion.Major
+    $isInteractive = Test-IsInteractiveSession
+
+    Write-Log "Runtime host version detected: PowerShell $currentMajor." -Level INFO
+
+    if ($currentMajor -ge 7) {
+        Write-Log 'PowerShell 7+ host detected. Startup bootstrap check complete.' -Level INFO
+        return
+    }
+
+    $pwshDetails = Get-PowerShell7Details
+    if ($pwshDetails.Available) {
+        Write-Log "PowerShell 7+ is installed at '$($pwshDetails.Path)'." -Level INFO
+
+        if ($isInteractive) {
+            $relaunchNow = Read-YesNoChoice -Prompt 'Relaunch this script now in PowerShell 7+ for full parallel support?' -DefaultYes $true
+            if ($relaunchNow) {
+                Write-Log "Relaunching in PowerShell 7+ using '$($pwshDetails.Path)'..." -Level INFO
+                $childExitCode = Invoke-PowerShell7Relaunch -PwshPath $pwshDetails.Path
+                if ($null -eq $childExitCode) {
+                    Write-Log 'Relaunch failed. Continuing in current host with sequential fallback behavior.' -Level WARNING
+                    return
+                }
+                exit $childExitCode
+            }
+
+            Write-Log 'Operator declined relaunch. This run will continue and use sequential fallback if parallel is requested.' -Level WARNING
+        }
+        else {
+            Write-Log 'Non-interactive session detected. Skipping relaunch prompt and continuing in current host.' -Level WARNING
+        }
+
+        return
+    }
+
+    Write-Log 'PowerShell 7+ is not currently installed on this machine.' -Level WARNING
+
+    if (-not $isInteractive) {
+        Write-Log 'Non-interactive session detected. Skipping PowerShell install attempt and continuing with sequential fallback behavior.' -Level WARNING
+        return
+    }
+
+    $attemptInstall = Read-YesNoChoice -Prompt 'Attempt to install PowerShell 7+ now using configured Windows Update service (WSUS/Microsoft Update)?' -DefaultYes $true
+    if (-not $attemptInstall) {
+        Write-Log 'Operator skipped PowerShell 7 installation attempt. Continuing in current host.' -Level WARNING
+        return
+    }
+
+    Write-Log 'Attempting PowerShell 7 install through configured Windows Update service...' -Level INFO
+    $installResult = Install-PowerShell7ViaWindowsUpdate
+    if ($installResult.Success) {
+        Write-Log $installResult.Message -Level SUCCESS
+        if ($installResult.RebootRequired) {
+            Write-Log 'Windows Update reported a reboot requirement after install. Relaunch may fail until reboot is completed.' -Level WARNING
+        }
+    }
+    else {
+        Write-Log $installResult.Message -Level WARNING
+    }
+
+    $pwshAfterInstall = Get-PowerShell7Details
+    if (-not $pwshAfterInstall.Available) {
+        Write-Log 'PowerShell 7+ is still unavailable after install attempt. Continuing with sequential fallback behavior.' -Level WARNING
+        return
+    }
+
+    Write-Log "PowerShell 7+ is now available at '$($pwshAfterInstall.Path)'." -Level SUCCESS
+    $relaunchAfterInstall = Read-YesNoChoice -Prompt 'Relaunch this script now in PowerShell 7+?' -DefaultYes $true
+    if (-not $relaunchAfterInstall) {
+        Write-Log 'Operator declined relaunch after install. Continuing in current host.' -Level WARNING
+        return
+    }
+
+    Write-Log "Relaunching in PowerShell 7+ using '$($pwshAfterInstall.Path)'..." -Level INFO
+    $childExitCodeAfterInstall = Invoke-PowerShell7Relaunch -PwshPath $pwshAfterInstall.Path
+    if ($null -eq $childExitCodeAfterInstall) {
+        Write-Log 'Relaunch failed after install. Continuing in current host with sequential fallback behavior.' -Level WARNING
+        return
+    }
+    exit $childExitCodeAfterInstall
+}
+
+function Get-InstallerFiles {
+    if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
+        return @()
+    }
+
+    return @(Get-ChildItem -Path $LocalMSIPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.msi', '.msix') })
+}
+
+function Test-InstallerFilesExist {
+    if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
+        throw "Script directory does not exist: $LocalMSIPath"
+    }
+
+    $allInstallerFiles = Get-InstallerFiles
     if ($allInstallerFiles.Count -eq 0) {
-        Write-Host "`n" + ("=" * 70) -ForegroundColor Yellow
-        Write-Host "WARNING: No Installer Files Found" -ForegroundColor Yellow
-        Write-Host ("=" * 70)
-        Write-Host "This script requires at least one MSI or MSIX file to proceed.`n" -ForegroundColor White
-        Write-Host "Solution:" -ForegroundColor Cyan
-        Write-Host "  1. Place your MSI or MSIX installer file(s) in the same directory as this script" -ForegroundColor Cyan
-        Write-Host "     Location: $LocalMSIPath`n" -ForegroundColor Cyan
-        Write-Host "  2. Run the script again`n" -ForegroundColor Cyan
-        Write-Host "Example:" -ForegroundColor Cyan
-        Write-Host "  - MyApplication.msi" -ForegroundColor Cyan
-        Write-Host "  - MyApplication.msix" -ForegroundColor Cyan
-        Write-Host ("=" * 70)
-        Write-Host "`nPress Enter to exit..."
-        Read-Host | Out-Null
-        exit 1
+        throw "No MSI or MSIX files found in $LocalMSIPath"
     }
 }
 
 function Get-MSIFile {
-    <#
-    .SYNOPSIS
-        Finds MSI and MSIX files in the script directory and prompts user to select one if multiple exist.
-    #>
-    
-    Write-Log "Scanning for MSI and MSIX files in '$LocalMSIPath'..." -Level INFO
-    
-    if (-not (Test-Path -Path $LocalMSIPath -PathType Container)) {
-        Write-Log "Script directory '$LocalMSIPath' does not exist." -Level ERROR
-        return $null
+    $installerFiles = Get-InstallerFiles
+    if ($installerFiles.Count -eq 0) { return $null }
+
+    if ($installerFiles.Count -eq 1) {
+        Write-Log "Installer selected automatically: $($installerFiles[0].Name)" -Level SUCCESS
+        return $installerFiles[0]
     }
 
-    $msiFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msi' -ErrorAction SilentlyContinue)
-    $msixFiles = @(Get-ChildItem -Path $LocalMSIPath -Filter '*.msix' -ErrorAction SilentlyContinue)
-    $allInstallerFiles = @($msiFiles) + @($msixFiles)
-    
-    if ($allInstallerFiles.Count -eq 0) {
-        Write-Log "No MSI or MSIX files found in '$LocalMSIPath'." -Level ERROR
-        return $null
-    }
-    
-    $msiFiles = $allInstallerFiles
-
-    if ($msiFiles.Count -eq 1) {
-        Write-Log "Found MSI file: $($msiFiles[0].Name)" -Level SUCCESS
-        return $msiFiles[0]
+    Write-Log "Found $($installerFiles.Count) installer files. Select one:" -Level INFO
+    for ($i = 0; $i -lt $installerFiles.Count; $i++) {
+        Write-Host "  [$($i + 1)] $($installerFiles[$i].Name)"
     }
 
-    # Multiple MSI files - prompt user to select
-    Write-Log "Found $($msiFiles.Count) MSI files. Please select one:" -Level INFO
-    Write-Host ""
-    
-    for ($i = 0; $i -lt $msiFiles.Count; $i++) {
-        Write-Host "  [$($i + 1)] $($msiFiles[$i].Name)"
-    }
-    
     while ($true) {
-        $selection = Read-Host "`nEnter the number of the MSI to install [1-$($msiFiles.Count)]"
-        
-        if ([int]::TryParse($selection, [ref]$null) -and $selection -ge 1 -and $selection -le $msiFiles.Count) {
-            $selectedFile = $msiFiles[$selection - 1]
-            Write-Log "Selected MSI: $($selectedFile.Name)" -Level SUCCESS
+        $selection = (Read-Host "Enter installer number [1-$($installerFiles.Count)]").Trim()
+        $selectionNumber = 0
+        if ([int]::TryParse($selection, [ref]$selectionNumber) -and $selectionNumber -ge 1 -and $selectionNumber -le $installerFiles.Count) {
+            $selectedFile = $installerFiles[$selectionNumber - 1]
+            Write-Log "Installer selected: $($selectedFile.Name)" -Level SUCCESS
             return $selectedFile
         }
 
-        Write-Log "Invalid selection. Please enter a number between 1 and $($msiFiles.Count)." -Level WARNING
+        Write-Log 'Invalid selection.' -Level WARNING
     }
 }
 
 # ============================================================================
-# REMOTE INSTALLATION
+# CREDENTIALS
 # ============================================================================
 
-function Install-RemoteMSI {
-    <#
-    .SYNOPSIS
-        Executes the MSI installation on the remote machine.
-    #>
+function Request-Credentials {
     param(
-        [Parameter(Mandatory = $true)]
-        [System.Management.Automation.Runspaces.PSSession]$Session,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$RemoteMSIPath
+        [string]$Message = 'Enter credentials'
     )
 
-    Write-Log "Starting silent MSI installation on remote machine..." -Level INFO
-    
-    try {
-        $installScript = {
-            param($MSIPath)
-            
-            # Execute MSI silently with no restart prompt
-            $process = Start-Process -FilePath 'msiexec.exe' `
-                -ArgumentList @("/i", $MSIPath, "/quiet", "/norestart") `
-                -Wait -PassThru -NoNewWindow
-            
-            return $process.ExitCode
-        }
-
-        $exitCode = Invoke-Command -Session $Session -ScriptBlock $installScript -ArgumentList $RemoteMSIPath
-
-        return $exitCode
-    }
-    catch {
-        Write-Log "Error executing installation: $($_.Exception.Message)" -Level ERROR
+    Write-Host $Message -ForegroundColor Cyan
+    $user = Read-Host 'User'
+    if ([string]::IsNullOrWhiteSpace($user)) {
         return $null
     }
+
+    $pass = Read-Host 'Password' -AsSecureString
+    if ($null -eq $pass) {
+        return $null
+    }
+
+    return New-Object System.Management.Automation.PSCredential($user.Trim(), $pass)
 }
 
-# ============================================================================
-# REBOOT DETECTION
-# ============================================================================
-
-function Test-PendingReboot {
-    <#
-    .SYNOPSIS
-        Checks if the remote machine requires a reboot using both registry and WMI methods.
-    #>
+function Test-RemoteAdmin {
     param(
         [Parameter(Mandatory = $true)]
         [System.Management.Automation.Runspaces.PSSession]$Session
     )
 
-    Write-Log "Checking for pending reboot indicators..." -Level INFO
-    
+    $isAdmin = Invoke-Command -Session $Session -ScriptBlock {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+
+    return [bool]$isAdmin
+}
+
+function Get-ValidatedCredentialForProbe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProbeComputer
+    )
+
+    Write-Log "Validating credentials first using probe machine '$ProbeComputer'." -Level INFO
+
     try {
-        $rebootScript = {
-            $requiresReboot = $false
-            
-            # Check registry for pending file rename operations
-            $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-            $regKey = Get-ItemProperty -Path $regPath -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-            
-            if ($regKey -and $regKey.PendingFileRenameOperations) {
-                $requiresReboot = $true
-            }
+        $probeSession = New-PSSession -ComputerName $ProbeComputer -ErrorAction Stop
+        $probeAdmin = Test-RemoteAdmin -Session $probeSession
+        Remove-PSSession -Session $probeSession -ErrorAction SilentlyContinue
 
-            # Check registry for Windows Update reboot required
-            $regPath2 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update'
-            $regKey2 = Get-ItemProperty -Path $regPath2 -Name 'RebootRequired' -ErrorAction SilentlyContinue
-            
-            if ($regKey2 -and $regKey2.RebootRequired) {
-                $requiresReboot = $true
-            }
-
-            # Check WMI for pending system restart
-            try {
-                $wmiInstance = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-                if ($wmiInstance -and $wmiInstance.PSBase.Properties['RebootRequired'] -and $wmiInstance.RebootRequired) {
-                    $requiresReboot = $true
-                }
-            }
-            catch {
-                # WMI may not be available, continue with registry checks
-            }
-
-            return $requiresReboot
+        if ($probeAdmin) {
+            Write-Log 'Current user credentials validated successfully (remote admin confirmed).' -Level SUCCESS
+            return $null
         }
 
-        $pendingReboot = Invoke-Command -Session $Session -ScriptBlock $rebootScript
-        
-        if ($pendingReboot) {
-            Write-Log "System reboot is required." -Level WARNING
-            return $true
-        }
-        else {
-            Write-Log "No pending reboot required." -Level SUCCESS
-            return $false
-        }
+        Write-Log 'Current user can connect but is not remote administrator. Prompting for credentials.' -Level WARNING
     }
     catch {
-        Write-Log "Error checking reboot status: $($_.Exception.Message)" -Level WARNING
-        return $false  # Assume no reboot needed if check fails
+        Write-Log "Current user credential probe failed: $($_.Exception.Message)" -Level WARNING
     }
+
+    $attempt = 0
+    while ($attempt -lt $MaxCredentialAttempts) {
+        $attempt++
+        $credential = Request-Credentials -Message "Enter administrator credentials for $ProbeComputer (attempt $attempt of $MaxCredentialAttempts)"
+        if ($null -eq $credential) {
+            throw 'Credential entry cancelled.'
+        }
+
+        try {
+            $testSession = New-PSSession -ComputerName $ProbeComputer -Credential $credential -ErrorAction Stop
+            $isAdmin = Test-RemoteAdmin -Session $testSession
+            Remove-PSSession -Session $testSession -ErrorAction SilentlyContinue
+
+            if (-not $isAdmin) {
+                Write-Log 'Credentials authenticated but are not local admin on probe machine.' -Level WARNING
+                continue
+            }
+
+            Write-Log 'Provided credentials validated successfully.' -Level SUCCESS
+            return $credential
+        }
+        catch {
+            Write-Log "Credential validation failed: $($_.Exception.Message)" -Level WARNING
+        }
+    }
+
+    throw "Failed to validate credentials after $MaxCredentialAttempts attempts."
 }
 
 # ============================================================================
-# REMOTE CLEANUP
+# BATCH FILE DISCOVERY / PARSING
 # ============================================================================
 
-function Remove-RemoteFile {
-    <#
-    .SYNOPSIS
-        Removes the MSI file from the remote machine.
-    #>
+function Find-BatchMachineFile {
+    $candidates = @(
+        Get-ChildItem -Path $ScriptDirectory -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @('.txt', '.csv') } |
+            Sort-Object -Property Name
+    )
+
+    if ($candidates.Count -gt 0) {
+        Write-Host "`nCandidate batch files found in script directory:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $candidates.Count; $i++) {
+            Write-Host "  [$($i + 1)] $($candidates[$i].Name)"
+        }
+
+        if ($candidates.Count -eq 1) {
+            $useFound = Get-Confirmation -Prompt "Use '$($candidates[0].Name)' as machine list file?"
+            if ($useFound) {
+                return $candidates[0].FullName
+            }
+        }
+        else {
+            $useFound = Get-Confirmation -Prompt 'Use one of these discovered files?'
+            if ($useFound) {
+                while ($true) {
+                    $selection = Read-Host "Select file number [1-$($candidates.Count)]"
+                    $selectionNumber = 0
+                    if ([int]::TryParse($selection, [ref]$selectionNumber) -and $selectionNumber -ge 1 -and $selectionNumber -le $candidates.Count) {
+                        return $candidates[$selectionNumber - 1].FullName
+                    }
+                    Write-Log 'Invalid selection.' -Level WARNING
+                }
+            }
+        }
+    }
+
+    while ($true) {
+        $manualPath = (Read-Host 'Enter full path to machine list file (CSV/TXT)').Trim()
+        if (Test-Path -Path $manualPath -PathType Leaf) {
+            $ext = [System.IO.Path]::GetExtension($manualPath).ToLowerInvariant()
+            if ($ext -in @('.txt', '.csv')) {
+                return $manualPath
+            }
+            Write-Log 'File must be .txt or .csv.' -Level WARNING
+            continue
+        }
+
+        Write-Log 'File path not found. Try again.' -Level WARNING
+    }
+}
+
+function Get-MachineNamesFromFile {
     param(
-        [Parameter(Mandatory = $true)]
-        [System.Management.Automation.Runspaces.PSSession]$Session,
-        
         [Parameter(Mandatory = $true)]
         [string]$FilePath
     )
 
+    $lines = Get-Content -Path $FilePath -ErrorAction Stop
+    $rawMachines = New-Object System.Collections.Generic.List[string]
+    $invalidCount = 0
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $trimmedLine = $line.Trim()
+        if ($trimmedLine.StartsWith('#')) { continue }
+
+        $firstColumn = ($trimmedLine -split ',', 2)[0]
+        $sanitized = ConvertTo-Hostname -RawName $firstColumn
+
+        if (-not $sanitized) {
+            $invalidCount++
+            continue
+        }
+
+        $rawMachines.Add($sanitized)
+    }
+
+    $uniqueMachines = $rawMachines | Sort-Object -Unique
+    Write-Log "Parsed $($rawMachines.Count) machine entries from '$FilePath'." -Level INFO
+    if ($invalidCount -gt 0) {
+        Write-Log "Filtered $invalidCount invalid machine entries during sanitization." -Level WARNING
+    }
+
+    return @($uniqueMachines)
+}
+
+function Get-ValidatedBatchMachines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$InputMachines
+    )
+
+    $validMachines = New-Object System.Collections.Generic.List[string]
+    $notInAD = New-Object System.Collections.Generic.List[string]
+    $offline = New-Object System.Collections.Generic.List[string]
+
+    foreach ($machine in $InputMachines) {
+        if (-not (Test-ComputerInAD -ComputerName $machine)) {
+            $notInAD.Add($machine)
+            continue
+        }
+
+        if (-not (Test-ComputerOnline -ComputerName $machine)) {
+            $offline.Add($machine)
+            continue
+        }
+
+        $validMachines.Add($machine)
+    }
+
+    Write-Log "Pre-validation summary: Total=$($InputMachines.Count), Valid=$($validMachines.Count), NotInAD=$($notInAD.Count), Offline=$($offline.Count)" -Level INFO
+
+    if ($notInAD.Count -gt 0) {
+        Write-Log "Excluded (Not in AD/DNS): $($notInAD -join ', ')" -Level WARNING
+    }
+
+    if ($offline.Count -gt 0) {
+        Write-Log "Excluded (Offline): $($offline -join ', ')" -Level WARNING
+    }
+
+    return @($validMachines)
+}
+
+# ============================================================================
+# INSTALL / RETRIES / RESULT MAPPING
+# ============================================================================
+
+function Get-MSIExitDescription {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode
+    )
+
+    switch ($ExitCode) {
+        0 { 'Success' }
+        1641 { 'Success, restart initiated' }
+        3010 { 'Success, reboot required' }
+        1601 { 'Windows Installer service unavailable' }
+        1602 { 'User cancelled installation' }
+        1603 { 'Fatal installation error' }
+        1618 { 'Another MSI installation is already in progress' }
+        1619 { 'Installer package could not be opened (possible corruption/inaccessible file)' }
+        1625 { 'Installation blocked by policy' }
+        1632 { 'Temporary folder inaccessible/full' }
+        1633 { 'Platform not supported' }
+        1638 { 'Another version of this product is already installed' }
+        default { 'Unknown MSI exit code' }
+    }
+}
+
+function Copy-MSIWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LocalPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RemotePath,
+
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Runspaces.PSSession]$Session
+    )
+
+    while ($true) {
+        $attempt = 0
+        foreach ($delay in $TransferRetryDelays) {
+            $attempt++
+            try {
+                Write-Log "Transfer attempt $attempt/$($TransferRetryDelays.Count) to $($Session.ComputerName)." -Level INFO
+                Copy-Item -Path $LocalPath -Destination $RemotePath -ToSession $Session -Force -ErrorAction Stop
+                Write-Log "Transfer succeeded to $($Session.ComputerName)." -Level SUCCESS
+                return $true
+            }
+            catch {
+                Write-Log "Transfer failed on attempt $attempt for $($Session.ComputerName): $($_.Exception.Message)" -Level WARNING
+                Write-Log "Waiting $delay second(s) before next transfer attempt..." -Level INFO
+                Start-Sleep -Seconds $delay
+            }
+        }
+
+        Write-Log "Transfer failed after all retry delays for $($Session.ComputerName)." -Level ERROR
+        Write-Host "Options: [R]etry transfer cycle, [A]bort run" -ForegroundColor Yellow
+        while ($true) {
+            $choice = (Read-Host 'Select option').Trim().ToUpperInvariant()
+            if ($choice -eq 'R') { break }
+            if ($choice -eq 'A') { return $false }
+            Write-Log 'Invalid choice. Enter R or A.' -Level WARNING
+        }
+    }
+}
+
+function Get-PendingRebootState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Runspaces.PSSession]$Session
+    )
+
     try {
-        Write-Log "Removing MSI from remote machine..." -Level INFO
-        
-        $removeScript = {
+        $pendingRebootState = Invoke-Command -Session $Session -ScriptBlock {
+            $state = [ordered]@{
+                PendingFileRenameOperations = $false
+                WindowsUpdateRebootRequired = $false
+                ComponentBasedServicingRebootPending = $false
+                WmiRebootRequired = $false
+            }
+
+            try {
+                $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+                $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+                if ($pendingRename -and $pendingRename.PendingFileRenameOperations) {
+                    $state.PendingFileRenameOperations = $true
+                }
+            }
+            catch {
+                # ignore probe errors
+            }
+
+            try {
+                $wuRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+                if (Test-Path -Path $wuRebootPath) {
+                    $state.WindowsUpdateRebootRequired = $true
+                }
+            }
+            catch {
+                # ignore probe errors
+            }
+
+            try {
+                $cbsRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+                if (Test-Path -Path $cbsRebootPath) {
+                    $state.ComponentBasedServicingRebootPending = $true
+                }
+            }
+            catch {
+                # ignore probe errors
+            }
+
+            try {
+                $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
+                    $state.WmiRebootRequired = $true
+                }
+            }
+            catch {
+                # ignore WMI probe errors
+            }
+
+            $any = $state.PendingFileRenameOperations -or
+                $state.WindowsUpdateRebootRequired -or
+                $state.ComponentBasedServicingRebootPending -or
+                $state.WmiRebootRequired
+
+            [pscustomobject]@{
+                ProbeSucceeded = $true
+                Any = [bool]$any
+                PendingFileRenameOperations = [bool]$state.PendingFileRenameOperations
+                WindowsUpdateRebootRequired = [bool]$state.WindowsUpdateRebootRequired
+                ComponentBasedServicingRebootPending = [bool]$state.ComponentBasedServicingRebootPending
+                WmiRebootRequired = [bool]$state.WmiRebootRequired
+            }
+        }
+
+        return $pendingRebootState
+    }
+    catch {
+        Write-Log "Could not determine reboot state for $($Session.ComputerName): $($_.Exception.Message)" -Level WARNING
+        return [pscustomobject]@{
+            ProbeSucceeded = $false
+            Any = $false
+            PendingFileRenameOperations = $false
+            WindowsUpdateRebootRequired = $false
+            ComponentBasedServicingRebootPending = $false
+            WmiRebootRequired = $false
+        }
+    }
+}
+
+function Get-RebootRequirementEvaluation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$InstallerExitCode,
+
+        [Parameter(Mandatory = $true)]
+        [object]$BeforeState,
+
+        [Parameter(Mandatory = $true)]
+        [object]$AfterState
+    )
+
+    $exitCodeRequiresReboot = $InstallerExitCode -in @(1641, 3010)
+    $beforeKnown = [bool]($BeforeState -and $BeforeState.ProbeSucceeded)
+    $afterKnown = [bool]($AfterState -and $AfterState.ProbeSucceeded)
+
+    $newPendingIndicators = $false
+    if ($beforeKnown -and $afterKnown) {
+        $newPendingIndicators =
+            ((-not [bool]$BeforeState.PendingFileRenameOperations) -and [bool]$AfterState.PendingFileRenameOperations) -or
+            ((-not [bool]$BeforeState.WindowsUpdateRebootRequired) -and [bool]$AfterState.WindowsUpdateRebootRequired) -or
+            ((-not [bool]$BeforeState.ComponentBasedServicingRebootPending) -and [bool]$AfterState.ComponentBasedServicingRebootPending) -or
+            ((-not [bool]$BeforeState.WmiRebootRequired) -and [bool]$AfterState.WmiRebootRequired)
+    }
+
+    $installationTriggered = $exitCodeRequiresReboot -or $newPendingIndicators
+    $rebootRequired = $installationTriggered
+
+    $message = if (-not $rebootRequired) {
+        'No reboot is required due to this installation.'
+    }
+    else {
+        'Reboot required due to this installation.'
+    }
+
+    return [pscustomobject]@{
+        RebootRequired = [bool]$rebootRequired
+        Message = $message
+    }
+}
+
+function Remove-RemoteMSI {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RemotePath
+    )
+
+    try {
+        Invoke-Command -Session $Session -ScriptBlock {
             param($Path)
             if (Test-Path -Path $Path) {
                 Remove-Item -Path $Path -Force -ErrorAction Stop
-                return $true
             }
-            return $false
-        }
+        } -ArgumentList $RemotePath
 
-        $result = Invoke-Command -Session $Session -ScriptBlock $removeScript -ArgumentList $FilePath
-        
-        if ($result) {
-            Write-Log "MSI removed successfully." -Level SUCCESS
-        }
-        else {
-            Write-Log "MSI file not found or already removed." -Level INFO
-        }
-        
-        return $true
+        Write-Log "Removed remote installer from $($Session.ComputerName): $RemotePath" -Level SUCCESS
     }
     catch {
-        Write-Log "Error removing MSI: $($_.Exception.Message)" -Level WARNING
-        return $false
+        Write-Log "Failed to remove remote installer from $($Session.ComputerName): $($_.Exception.Message)" -Level WARNING
+    }
+}
+
+function New-Result {
+    param(
+        [string]$MachineName,
+        [string]$Status,
+        [int]$ExitCode,
+        [string]$Message,
+        [bool]$RebootRequired,
+        [int]$Attempt,
+        [datetime]$StartTime,
+        [datetime]$EndTime
+    )
+
+    [pscustomobject]@{
+        MachineName     = $MachineName
+        Status          = $Status
+        ExitCode        = $ExitCode
+        ExitDescription = if ($ExitCode -ge 0) { Get-MSIExitDescription -ExitCode $ExitCode } else { $null }
+        Message         = $Message
+        RebootRequired  = $RebootRequired
+        Attempt         = $Attempt
+        StartTime       = $StartTime
+        EndTime         = $EndTime
+        DurationSeconds = [int]($EndTime - $StartTime).TotalSeconds
+    }
+}
+
+function Invoke-MachineInstall {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$InstallerFile,
+
+        [Parameter(Mandatory = $false)]
+        [pscredential]$Credential,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Attempt
+    )
+
+    $startTime = Get-Date
+    $session = $null
+    $exitCode = -1
+
+    try {
+        Write-Log "[$ComputerName] Attempt ${Attempt}: Creating remote session..." -Level INFO
+        if ($Credential) {
+            $session = New-PSSession -ComputerName $ComputerName -Credential $Credential -ErrorAction Stop
+        }
+        else {
+            $session = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
+        }
+
+        Invoke-Command -Session $session -ScriptBlock {
+            param($TempPath)
+            if (-not (Test-Path -Path $TempPath)) {
+                New-Item -Path $TempPath -ItemType Directory -Force | Out-Null
+            }
+        } -ArgumentList $RemoteTempPath
+
+        $remoteInstallerPath = Join-Path -Path $RemoteTempPath -ChildPath $InstallerFile.Name
+
+        $preInstallRebootState = Get-PendingRebootState -Session $session
+
+        $copySucceeded = Copy-MSIWithRetry -LocalPath $InstallerFile.FullName -RemotePath $remoteInstallerPath -Session $session
+        if (-not $copySucceeded) {
+            $endTime = Get-Date
+            return New-Result -MachineName $ComputerName -Status 'Failed' -ExitCode -1 -Message 'Transfer aborted by operator.' -RebootRequired $false -Attempt $Attempt -StartTime $startTime -EndTime $endTime
+        }
+
+        Write-Log "[$ComputerName] Starting installer execution..." -Level INFO
+        $installJob = Invoke-Command -Session $session -AsJob -ScriptBlock {
+            param($RemotePath)
+            $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $RemotePath, '/quiet', '/norestart') -Wait -PassThru -NoNewWindow
+            return [int]$process.ExitCode
+        } -ArgumentList $remoteInstallerPath
+
+        $installSpinnerFrames = @('|', '/', '-', '\')
+        $installSpinnerIndex = 0
+        $installSpinnerMessage = "[$ComputerName] MSI installation in progress"
+
+        while ($installJob.State -in @('NotStarted', 'Running', 'Blocked')) {
+            $frame = $installSpinnerFrames[$installSpinnerIndex % $installSpinnerFrames.Count]
+            Write-Host "`r[$frame] $installSpinnerMessage" -NoNewline -ForegroundColor Cyan
+            $installSpinnerIndex++
+            Start-Sleep -Milliseconds 150
+        }
+
+        Write-Host "`r[OK] $installSpinnerMessage" -ForegroundColor Cyan
+
+        if ($installJob.State -ne 'Completed') {
+            $state = $installJob.State
+            Remove-Job -Job $installJob -Force -ErrorAction SilentlyContinue
+            throw "Installer execution job ended in unexpected state '$state'."
+        }
+
+        $exitCodeOutput = @($installJob | Receive-Job -Keep)
+        Remove-Job -Job $installJob -Force -ErrorAction SilentlyContinue
+        if ($exitCodeOutput.Count -eq 0) {
+            throw 'Installer execution did not return an exit code.'
+        }
+
+        $exitCode = [int]$exitCodeOutput[0]
+
+        $desc = Get-MSIExitDescription -ExitCode $exitCode
+        Write-Log "[$ComputerName] Installer completed with exit code $exitCode ($desc)." -Level INFO
+
+        $success = $exitCode -in @(0, 1641, 3010)
+
+        if ($success) {
+            $postInstallRebootState = Get-PendingRebootState -Session $session
+            $rebootEvaluation = Get-RebootRequirementEvaluation -InstallerExitCode $exitCode -BeforeState $preInstallRebootState -AfterState $postInstallRebootState
+            $rebootRequired = [bool]$rebootEvaluation.RebootRequired
+            $successMessage = "Installation completed successfully. $($rebootEvaluation.Message)"
+
+            Write-Log "[$ComputerName] $($rebootEvaluation.Message)" -Level INFO
+
+            Remove-RemoteMSI -Session $session -RemotePath $remoteInstallerPath
+
+            $endTime = Get-Date
+            return New-Result -MachineName $ComputerName -Status 'Success' -ExitCode $exitCode -Message $successMessage -RebootRequired $rebootRequired -Attempt $Attempt -StartTime $startTime -EndTime $endTime
+        }
+
+        if ($exitCode -eq 1619) {
+            Write-Log "[$ComputerName] Exit code 1619 indicates package open/corruption issue. Removing remote installer copy." -Level WARNING
+            Remove-RemoteMSI -Session $session -RemotePath $remoteInstallerPath
+        }
+        else {
+            Write-Log "[$ComputerName] Installation failed. Preserving MSI on remote machine for retry/troubleshooting." -Level WARNING
+        }
+
+        $endTime = Get-Date
+        return New-Result -MachineName $ComputerName -Status 'Failed' -ExitCode $exitCode -Message "Installation failed: $desc" -RebootRequired $false -Attempt $Attempt -StartTime $startTime -EndTime $endTime
+    }
+    catch {
+        $endTime = Get-Date
+        return New-Result -MachineName $ComputerName -Status 'Failed' -ExitCode $exitCode -Message "Execution error: $($_.Exception.Message)" -RebootRequired $false -Attempt $Attempt -StartTime $startTime -EndTime $endTime
+    }
+    finally {
+        if ($session) {
+            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Read-RetryChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MachineName,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Attempt,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FailureMessage
+    )
+
+    Write-Host "`nFAILED MACHINE: $MachineName" -ForegroundColor Red
+    Write-Host "Attempt: $Attempt" -ForegroundColor Yellow
+    Write-Host "Exit Code: $ExitCode" -ForegroundColor Yellow
+    Write-Host "Description: $Description" -ForegroundColor Yellow
+    Write-Host "Details: $FailureMessage" -ForegroundColor Yellow
+    Write-Host 'Retry will run ONLY on failed machine(s), not the next batch.' -ForegroundColor Cyan
+    Write-Host 'Options: [R]etry failed machine, [S]kip machine, [A]bort run' -ForegroundColor Cyan
+
+    while ($true) {
+        $choice = (Read-Host 'Select option').Trim().ToUpperInvariant()
+        if ($choice -in @('R', 'S', 'A')) { return $choice }
+        Write-Log 'Invalid choice. Enter R, S, or A.' -Level WARNING
+    }
+}
+
+function Get-ChunkedArrays {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$InputArray,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ChunkSize
+    )
+
+    $chunks = @()
+    for ($i = 0; $i -lt $InputArray.Count; $i += $ChunkSize) {
+        $end = [Math]::Min($i + $ChunkSize - 1, $InputArray.Count - 1)
+        $chunks += ,(@($InputArray[$i..$end]))
+    }
+    return ,$chunks
+}
+
+function Update-BatchFileForSuccesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$SuccessfulMachines
+    )
+
+    if (-not (Test-Path -Path $FilePath -PathType Leaf)) {
+        Write-Log "Batch file not found for update: $FilePath" -Level WARNING
+        return
+    }
+
+    if ($SuccessfulMachines.Count -eq 0) {
+        Write-Log 'No successful machines to mark in source file.' -Level INFO
+        return
+    }
+
+    $successSet = @{}
+    foreach ($machine in $SuccessfulMachines) {
+        $successSet[$machine.ToUpperInvariant()] = $true
+    }
+
+    $lines = Get-Content -Path $FilePath
+    $updatedLines = New-Object System.Collections.Generic.List[string]
+    $commentedCount = 0
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            $updatedLines.Add($line)
+            continue
+        }
+
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith('#')) {
+            $updatedLines.Add($line)
+            continue
+        }
+
+        $firstColumn = ($trimmed -split ',', 2)[0]
+        $sanitized = ConvertTo-Hostname -RawName $firstColumn
+
+        if ($sanitized -and $successSet.ContainsKey($sanitized.ToUpperInvariant())) {
+            $updatedLines.Add("# $line")
+            $commentedCount++
+        }
+        else {
+            $updatedLines.Add($line)
+        }
+    }
+
+    Set-Content -Path $FilePath -Value $updatedLines -Encoding UTF8
+    Write-Log "Marked $commentedCount successful machine line(s) in '$FilePath'." -Level SUCCESS
+}
+
+function Invoke-Deployment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Machines,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$InstallerFile,
+
+        [Parameter(Mandatory = $false)]
+        [pscredential]$Credential,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ThrottleLimit,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InteractiveRetries
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $attemptMap = @{}
+
+    $batchSize = [Math]::Max($ThrottleLimit, 1)
+    $chunks = Get-ChunkedArrays -InputArray $Machines -ChunkSize $batchSize
+    Write-Log "Batch planner: Machines=$($Machines.Count), RequestedThrottle=$ThrottleLimit, EffectiveThrottle=$batchSize, PlannedBatches=$($chunks.Count), HostPS=$($PSVersionTable.PSVersion.Major)." -Level INFO
+
+    for ($chunkIndex = 0; $chunkIndex -lt $chunks.Count; $chunkIndex++) {
+        $chunk = @($chunks[$chunkIndex])
+        Write-Log "Starting batch $($chunkIndex + 1)/$($chunks.Count) with $($chunk.Count) machine(s)." -Level INFO
+
+        $batchResults = New-Object System.Collections.Generic.List[object]
+        foreach ($machine in $chunk) {
+            if (-not $attemptMap.ContainsKey($machine)) {
+                $attemptMap[$machine] = 0
+            }
+            $attemptMap[$machine]++
+        }
+
+        $canRunParallel = $batchSize -gt 1 -and $PSVersionTable.PSVersion.Major -ge 7
+        if ($canRunParallel) {
+            Write-Log "Running this batch in parallel with throttle $batchSize." -Level INFO
+
+            $parallelJob = $chunk | ForEach-Object -Parallel {
+                $installerFile = $using:InstallerFile
+                $credential = $using:Credential
+                $remoteTempPath = $using:RemoteTempPath
+                $delays = $using:TransferRetryDelays
+
+                $machine = $_
+                $attempt = 1
+                $startTime = Get-Date
+                $session = $null
+                $exitCode = -1
+
+                function Get-ExitDesc {
+                    param([int]$Code)
+                    switch ($Code) {
+                        0 { 'Success' }
+                        1641 { 'Success, restart initiated' }
+                        3010 { 'Success, reboot required' }
+                        1601 { 'Windows Installer service unavailable' }
+                        1602 { 'User cancelled installation' }
+                        1603 { 'Fatal installation error' }
+                        1618 { 'Another MSI installation is already in progress' }
+                        1619 { 'Installer package could not be opened (possible corruption/inaccessible file)' }
+                        1625 { 'Installation blocked by policy' }
+                        1632 { 'Temporary folder inaccessible/full' }
+                        1633 { 'Platform not supported' }
+                        1638 { 'Another version of this product is already installed' }
+                        default { 'Unknown MSI exit code' }
+                    }
+                }
+
+                try {
+                    if ($credential) {
+                        $session = New-PSSession -ComputerName $machine -Credential $credential -ErrorAction Stop
+                    }
+                    else {
+                        $session = New-PSSession -ComputerName $machine -ErrorAction Stop
+                    }
+
+                    function Get-RebootState {
+                        param([System.Management.Automation.Runspaces.PSSession]$Session)
+
+                        try {
+                            $rebootState = Invoke-Command -Session $Session -ScriptBlock {
+                                $state = [ordered]@{
+                                    PendingFileRenameOperations = $false
+                                    WindowsUpdateRebootRequired = $false
+                                    ComponentBasedServicingRebootPending = $false
+                                    WmiRebootRequired = $false
+                                }
+
+                                try {
+                                    $regPath1 = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+                                    $pendingRename = Get-ItemProperty -Path $regPath1 -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+                                    if ($pendingRename -and $pendingRename.PendingFileRenameOperations) {
+                                        $state.PendingFileRenameOperations = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $wuRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+                                    if (Test-Path -Path $wuRebootPath) {
+                                        $state.WindowsUpdateRebootRequired = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $cbsRebootPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+                                    if (Test-Path -Path $cbsRebootPath) {
+                                        $state.ComponentBasedServicingRebootPending = $true
+                                    }
+                                }
+                                catch {}
+
+                                try {
+                                    $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                                    if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
+                                        $state.WmiRebootRequired = $true
+                                    }
+                                }
+                                catch {}
+
+                                $any = $state.PendingFileRenameOperations -or
+                                    $state.WindowsUpdateRebootRequired -or
+                                    $state.ComponentBasedServicingRebootPending -or
+                                    $state.WmiRebootRequired
+
+                                return [pscustomobject]@{
+                                    ProbeSucceeded = $true
+                                    Any = [bool]$any
+                                    PendingFileRenameOperations = [bool]$state.PendingFileRenameOperations
+                                    WindowsUpdateRebootRequired = [bool]$state.WindowsUpdateRebootRequired
+                                    ComponentBasedServicingRebootPending = [bool]$state.ComponentBasedServicingRebootPending
+                                    WmiRebootRequired = [bool]$state.WmiRebootRequired
+                                }
+                            }
+
+                            return $rebootState
+                        }
+                        catch {
+                            return [pscustomobject]@{
+                                ProbeSucceeded = $false
+                                Any = $false
+                                PendingFileRenameOperations = $false
+                                WindowsUpdateRebootRequired = $false
+                                ComponentBasedServicingRebootPending = $false
+                                WmiRebootRequired = $false
+                            }
+                        }
+                    }
+
+                    function Get-RebootEval {
+                        param(
+                            [int]$InstallerExitCode,
+                            [object]$BeforeState,
+                            [object]$AfterState
+                        )
+
+                        $exitCodeRequiresReboot = $InstallerExitCode -in @(1641, 3010)
+                        $beforeKnown = [bool]($BeforeState -and $BeforeState.ProbeSucceeded)
+                        $afterKnown = [bool]($AfterState -and $AfterState.ProbeSucceeded)
+
+                        $newPendingIndicators = $false
+                        if ($beforeKnown -and $afterKnown) {
+                            $newPendingIndicators =
+                                ((-not [bool]$BeforeState.PendingFileRenameOperations) -and [bool]$AfterState.PendingFileRenameOperations) -or
+                                ((-not [bool]$BeforeState.WindowsUpdateRebootRequired) -and [bool]$AfterState.WindowsUpdateRebootRequired) -or
+                                ((-not [bool]$BeforeState.ComponentBasedServicingRebootPending) -and [bool]$AfterState.ComponentBasedServicingRebootPending) -or
+                                ((-not [bool]$BeforeState.WmiRebootRequired) -and [bool]$AfterState.WmiRebootRequired)
+                        }
+
+                        $installationTriggered = $exitCodeRequiresReboot -or $newPendingIndicators
+                        $rebootRequired = $installationTriggered
+
+                        $message = if (-not $rebootRequired) {
+                            'No reboot is required due to this installation.'
+                        }
+                        else {
+                            'Reboot required due to this installation.'
+                        }
+
+                        return [pscustomobject]@{
+                            RebootRequired = [bool]$rebootRequired
+                            Message = $message
+                        }
+                    }
+
+                    Invoke-Command -Session $session -ScriptBlock {
+                        param($TempPath)
+                        if (-not (Test-Path -Path $TempPath)) {
+                            New-Item -Path $TempPath -ItemType Directory -Force | Out-Null
+                        }
+                    } -ArgumentList $remoteTempPath
+
+                    $preInstallRebootState = Get-RebootState -Session $session
+
+                    $remoteInstallerPath = Join-Path -Path $remoteTempPath -ChildPath $installerFile.Name
+                    $copied = $false
+                    for ($i = 0; $i -lt $delays.Count; $i++) {
+                        try {
+                            $previousProgressPreference = $ProgressPreference
+                            $ProgressPreference = 'SilentlyContinue'
+                            try {
+                                Copy-Item -Path $installerFile.FullName -Destination $remoteInstallerPath -ToSession $session -Force -ErrorAction Stop
+                            }
+                            finally {
+                                $ProgressPreference = $previousProgressPreference
+                            }
+                            $copied = $true
+                            break
+                        }
+                        catch {
+                            Start-Sleep -Seconds $delays[$i]
+                        }
+                    }
+
+                    if (-not $copied) {
+                        $endTime = Get-Date
+                        return [pscustomobject]@{
+                            MachineName     = $machine
+                            Status          = 'Failed'
+                            ExitCode        = -1
+                            ExitDescription = $null
+                            Message         = 'Transfer failed after retry delays in parallel mode.'
+                            RebootRequired  = $false
+                            Attempt         = $attempt
+                            StartTime       = $startTime
+                            EndTime         = $endTime
+                            DurationSeconds = [int]($endTime - $startTime).TotalSeconds
+                        }
+                    }
+
+                    $exitCode = Invoke-Command -Session $session -ScriptBlock {
+                        param($RemotePath)
+                        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $RemotePath, '/quiet', '/norestart') -Wait -PassThru -NoNewWindow
+                        return [int]$process.ExitCode
+                    } -ArgumentList $remoteInstallerPath
+
+                    $success = $exitCode -in @(0, 1641, 3010)
+                    $rebootRequired = $false
+                    $successMessage = 'Installation completed successfully.'
+
+                    if ($success) {
+                        $postInstallRebootState = Get-RebootState -Session $session
+                        $rebootEval = Get-RebootEval -InstallerExitCode $exitCode -BeforeState $preInstallRebootState -AfterState $postInstallRebootState
+                        $rebootRequired = [bool]$rebootEval.RebootRequired
+                        $successMessage = "Installation completed successfully. $($rebootEval.Message)"
+
+                        try {
+                            Invoke-Command -Session $session -ScriptBlock {
+                                param($Path)
+                                if (Test-Path -Path $Path) { Remove-Item -Path $Path -Force -ErrorAction Stop }
+                            } -ArgumentList $remoteInstallerPath
+                        }
+                        catch {}
+
+                        $endTime = Get-Date
+                        return [pscustomobject]@{
+                            MachineName     = $machine
+                            Status          = 'Success'
+                            ExitCode        = $exitCode
+                            ExitDescription = Get-ExitDesc -Code $exitCode
+                            Message         = $successMessage
+                            RebootRequired  = $rebootRequired
+                            Attempt         = $attempt
+                            StartTime       = $startTime
+                            EndTime         = $endTime
+                            DurationSeconds = [int]($endTime - $startTime).TotalSeconds
+                        }
+                    }
+
+                    if ($exitCode -eq 1619) {
+                        try {
+                            Invoke-Command -Session $session -ScriptBlock {
+                                param($Path)
+                                if (Test-Path -Path $Path) { Remove-Item -Path $Path -Force -ErrorAction Stop }
+                            } -ArgumentList $remoteInstallerPath
+                        }
+                        catch {}
+                    }
+
+                    $endTime = Get-Date
+                    return [pscustomobject]@{
+                        MachineName     = $machine
+                        Status          = 'Failed'
+                        ExitCode        = $exitCode
+                        ExitDescription = Get-ExitDesc -Code $exitCode
+                        Message         = "Installation failed: $(Get-ExitDesc -Code $exitCode)"
+                        RebootRequired  = $false
+                        Attempt         = $attempt
+                        StartTime       = $startTime
+                        EndTime         = $endTime
+                        DurationSeconds = [int]($endTime - $startTime).TotalSeconds
+                    }
+                }
+                catch {
+                    $endTime = Get-Date
+                    return [pscustomobject]@{
+                        MachineName     = $machine
+                        Status          = 'Failed'
+                        ExitCode        = $exitCode
+                        ExitDescription = if ($exitCode -ge 0) { Get-ExitDesc -Code $exitCode } else { $null }
+                        Message         = "Execution error: $($_.Exception.Message)"
+                        RebootRequired  = $false
+                        Attempt         = $attempt
+                        StartTime       = $startTime
+                        EndTime         = $endTime
+                        DurationSeconds = [int]($endTime - $startTime).TotalSeconds
+                    }
+                }
+                finally {
+                    if ($session) {
+                        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+                    }
+                }
+            } -ThrottleLimit $batchSize -AsJob
+
+            $batchSpinnerFrames = @('|', '/', '-', '\')
+            $batchSpinnerIndex = 0
+            $batchSpinnerMessage = "Batch $($chunkIndex + 1)/$($chunks.Count) active (parallel transfer/install in progress)"
+
+            while ($parallelJob.State -in @('NotStarted', 'Running', 'Blocked')) {
+                $frame = $batchSpinnerFrames[$batchSpinnerIndex % $batchSpinnerFrames.Count]
+                Write-Host "`r[$frame] $batchSpinnerMessage" -NoNewline -ForegroundColor Cyan
+                $batchSpinnerIndex++
+                Start-Sleep -Milliseconds 150
+            }
+
+            Write-Host "`r[OK] $batchSpinnerMessage" -ForegroundColor Cyan
+
+            if ($parallelJob.State -ne 'Completed') {
+                $parallelState = $parallelJob.State
+                Remove-Job -Job $parallelJob -Force -ErrorAction SilentlyContinue
+                throw "Parallel batch processing ended with state '$parallelState'."
+            }
+
+            $parallelResults = @($parallelJob | Receive-Job -Keep)
+            Remove-Job -Job $parallelJob -Force -ErrorAction SilentlyContinue
+
+            foreach ($parallelResult in $parallelResults) {
+                $parallelResult.Attempt = $attemptMap[$parallelResult.MachineName]
+                $batchResults.Add($parallelResult)
+                $results.Add($parallelResult)
+
+                $desc = if ($parallelResult.ExitCode -ge 0) { "$($parallelResult.ExitCode) ($($parallelResult.ExitDescription))" } else { 'N/A' }
+                Write-Log "[$($parallelResult.MachineName)] Result=$($parallelResult.Status), Attempt=$($parallelResult.Attempt), Exit=$desc" -Level INFO
+            }
+        }
+        else {
+            if ($batchSize -gt 1 -and $PSVersionTable.PSVersion.Major -lt 7) {
+                Write-Log 'Parallel mode requested but PowerShell 7+ is required for runspace parallelism. Falling back to sequential execution.' -Level WARNING
+            }
+
+            foreach ($machine in $chunk) {
+                $currentAttempt = $attemptMap[$machine]
+                $result = Invoke-MachineInstall -ComputerName $machine -InstallerFile $InstallerFile -Credential $Credential -Attempt $currentAttempt
+                $batchResults.Add($result)
+                $results.Add($result)
+            }
+        }
+
+        $remainingFailures = @($batchResults | Where-Object { $_.Status -eq 'Failed' })
+        while ($InteractiveRetries -and $remainingFailures.Count -gt 0) {
+            Write-Log "Batch $($chunkIndex + 1) completed with $($remainingFailures.Count) failed machine(s)." -Level WARNING
+            $retryQueue = New-Object System.Collections.Generic.List[string]
+
+            foreach ($failed in $remainingFailures) {
+                $description = if ($failed.ExitCode -ge 0) { $failed.ExitDescription } else { 'Execution/connection error' }
+                $choice = Read-RetryChoice -MachineName $failed.MachineName -Attempt $failed.Attempt -ExitCode $failed.ExitCode -Description $description -FailureMessage $failed.Message
+
+                if ($choice -eq 'A') {
+                    Write-Log 'Operator selected abort during retry prompt.' -Level ERROR
+                    return $results
+                }
+
+                if ($choice -eq 'R') {
+                    $retryQueue.Add($failed.MachineName)
+                }
+                else {
+                    Write-Log "Operator skipped retry for $($failed.MachineName)." -Level INFO
+                }
+            }
+
+            if ($retryQueue.Count -eq 0) {
+                break
+            }
+
+            Write-Log "Retry round starting for failed machine(s) only: $($retryQueue -join ', ')" -Level INFO
+            $newFailures = New-Object System.Collections.Generic.List[object]
+
+            foreach ($retryMachine in $retryQueue) {
+                $attemptMap[$retryMachine]++
+                $retryAttempt = $attemptMap[$retryMachine]
+                $retryResult = Invoke-MachineInstall -ComputerName $retryMachine -InstallerFile $InstallerFile -Credential $Credential -Attempt $retryAttempt
+                $results.Add($retryResult)
+
+                if ($retryResult.Status -eq 'Failed') {
+                    $newFailures.Add($retryResult)
+                }
+            }
+
+            $remainingFailures = @($newFailures)
+        }
+    }
+
+    return $results
+}
+
+function Get-FinalResultPerMachine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$AllResults
+    )
+
+    return $AllResults |
+        Group-Object -Property MachineName |
+        ForEach-Object {
+            $_.Group | Sort-Object -Property EndTime -Descending | Select-Object -First 1
+        }
+}
+
+function Write-Summary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$FinalResults,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStart
+    )
+
+    $successCount = @($FinalResults | Where-Object { $_.Status -eq 'Success' }).Count
+    $failedCount = @($FinalResults | Where-Object { $_.Status -eq 'Failed' }).Count
+    $totalCount = $FinalResults.Count
+    $rebootCount = @($FinalResults | Where-Object { $_.RebootRequired }).Count
+    $duration = (Get-Date) - $RunStart
+
+    Write-Host "`n" + ('=' * 70)
+    Write-Host 'Deployment Summary' -ForegroundColor Cyan
+    Write-Host ('=' * 70)
+    $overallStatus = if ($failedCount -eq 0) { 'SUCCESS' } elseif ($successCount -gt 0) { 'PARTIAL SUCCESS' } else { 'FAILED' }
+    $overallColor = if ($failedCount -eq 0) { 'Green' } elseif ($successCount -gt 0) { 'Yellow' } else { 'Red' }
+    Write-Host "OVERALL RESULT: $overallStatus" -ForegroundColor $overallColor
+    Write-Host ('=' * 70)
+    Write-Host "Total Machines: $totalCount"
+    Write-Host "Successful: $successCount"
+    Write-Host "Failed: $failedCount"
+    Write-Host "Reboot Required: $rebootCount"
+    Write-Host "Total Duration: $([int]$duration.TotalMinutes)m $($duration.Seconds)s"
+    Write-Host "Log File: $script:LogPath"
+    Write-Host ('=' * 70)
+
+    $machineWidth = 22
+    $statusWidth = 10
+    $attemptWidth = 8
+    $exitWidth = 22
+    $rebootWidth = 8
+    $durationWidth = 10
+
+    $line = '+' + ('-' * $machineWidth) + '+' + ('-' * $statusWidth) + '+' + ('-' * $attemptWidth) + '+' + ('-' * $exitWidth) + '+' + ('-' * $rebootWidth) + '+' + ('-' * $durationWidth) + '+'
+    $header = "|{0}|{1}|{2}|{3}|{4}|{5}|" -f @(
+        'Machine'.PadRight($machineWidth),
+        'Status'.PadRight($statusWidth),
+        'Attempt'.PadRight($attemptWidth),
+        'Exit'.PadRight($exitWidth),
+        'Reboot'.PadRight($rebootWidth),
+        'Seconds'.PadRight($durationWidth)
+    )
+
+    Write-Host ''
+    Write-Host 'Result Table' -ForegroundColor Cyan
+    Write-Host $line
+    Write-Host $header
+    Write-Host $line
+
+    foreach ($row in $FinalResults | Sort-Object -Property MachineName) {
+        $machineValue = [string]$row.MachineName
+        if ($machineValue.Length -gt $machineWidth) {
+            $machineValue = $machineValue.Substring(0, $machineWidth)
+        }
+
+        $statusValue = [string]$row.Status
+        $attemptValue = [string]$row.Attempt
+        $exitValue = if ($row.ExitCode -ge 0) { "$($row.ExitCode) ($($row.ExitDescription))" } else { 'N/A' }
+        if ($exitValue.Length -gt $exitWidth) {
+            $exitValue = $exitValue.Substring(0, $exitWidth)
+        }
+
+        $rebootValue = if ($row.RebootRequired) { 'Yes' } else { 'No' }
+        $secondsValue = [string]$row.DurationSeconds
+
+        $rowLine = "|{0}|{1}|{2}|{3}|{4}|{5}|" -f @(
+            $machineValue.PadRight($machineWidth),
+            $statusValue.PadRight($statusWidth),
+            $attemptValue.PadRight($attemptWidth),
+            $exitValue.PadRight($exitWidth),
+            $rebootValue.PadRight($rebootWidth),
+            $secondsValue.PadRight($durationWidth)
+        )
+
+        $rowColor = if ($row.Status -eq 'Success') { 'Green' } else { 'Red' }
+        Write-Host $rowLine -ForegroundColor $rowColor
+    }
+
+    Write-Host $line
+
+    Write-Log "Summary: Total=$totalCount, Success=$successCount, Failed=$failedCount, RebootRequired=$rebootCount, DurationSeconds=$([int]$duration.TotalSeconds)" -Level INFO
+
+    $failureRows = @($FinalResults | Where-Object { $_.Status -eq 'Failed' })
+    if ($failureRows.Count -gt 0) {
+        Write-Log 'Failed machines detail:' -Level WARNING
+        foreach ($row in $failureRows) {
+            $desc = if ($row.ExitCode -ge 0) { "$($row.ExitCode) ($($row.ExitDescription))" } else { 'N/A' }
+            Write-Log "  $($row.MachineName) | Attempts=$($row.Attempt) | Exit=$desc | Message=$($row.Message)" -Level WARNING
+        }
     }
 }
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN FLOW
 # ============================================================================
 
 function Main {
-    try {
-        # ====================================================================
-        # PHASE 0: VERIFY INSTALLER FILES EXIST
-        # ====================================================================
-        
-        Test-InstallerFilesExist
-        
-        # ====================================================================
-        # PHASE 1: INPUT VALIDATION
-        # ====================================================================
-        
-        $ComputerName = Get-ValidatedHostname
-        
-        # Set log path now that we have hostname
-        # Ensure Logs directory exists
-        if (-not (Test-Path -Path $LogDirectory)) {
-            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-        }
-        
-        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $baseLogName = "{0}_{1}" -f $ComputerName, $timestamp
-        $LogPath = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Incomplete.log"
-        
-        Write-Log "Installation session started for $ComputerName" -Level INFO
-        
-        # ====================================================================
-        # PHASE 1.5: CONNECTIVITY CHECK (after hostname validation)
-        # ====================================================================
-        
-        # Test connectivity - if not admin, user can still proceed with credentials
-        if ([Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains 'S-1-5-32-544') {
-            # User is admin - perform connectivity test
-            if (-not (Test-ComputerOnline -ComputerName $ComputerName)) {
-                Write-Log "Computer '$ComputerName' is not responding. Proceed with caution." -Level WARNING
-            }
-        }
-        else {
-            Write-Log "Note: Running as non-admin. Skipping ICMP connectivity test (requires elevation)." -Level INFO
-            Write-Log "Connectivity will be verified when establishing remote session." -Level INFO
-        }
-        
-        # ====================================================================
-        # PHASE 2: MSI SELECTION
-        # ====================================================================
+    $runStart = Get-Date
+    Initialize-RunLog
+    Write-Log 'Run started.' -Level INFO
 
-        
-        $msiFile = Get-MSIFile
-        if ($null -eq $msiFile) {
-            $errorLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Failure.log"
-            if ($LogPath -ne $errorLog) {
-                if (Test-Path $LogPath) { Move-Item -Path $LogPath -Destination $errorLog -Force }
+    try {
+        Invoke-PowerShell7Bootstrap
+
+        Test-InstallerFilesExist
+        $installer = Get-MSIFile
+        if ($null -eq $installer) {
+            throw 'No installer selected.'
+        }
+
+        $mode = Get-ExecutionMode
+        $machineListFile = $null
+        $rawBatchMachines = @()
+
+        if ($mode -eq 'Single') {
+            $singleHost = Get-ValidatedSingleHostname
+            Write-Log "Single-machine mode selected for '$singleHost'." -Level INFO
+
+            $credential = Get-ValidatedCredentialForProbe -ProbeComputer $singleHost
+
+            if (-not (Test-ComputerInAD -ComputerName $singleHost)) {
+                throw "Target '$singleHost' failed AD/DNS validation."
             }
-            throw "No valid MSI file selected."
-        }
-        
-        $localMSIFullPath = $msiFile.FullName
-        Write-Log "MSI file selected: $($msiFile.Name)" -Level SUCCESS
-        
-        # ====================================================================
-        # PHASE 3: CREDENTIAL HANDLING
-        # ====================================================================
-        
-        $credential = Get-SessionCredentials -ComputerName $ComputerName
-        
-        # ====================================================================
-        # PHASE 4: REMOTE SESSION CREATION
-        # ====================================================================
-        
-        Write-Log "Creating remote session to $ComputerName..." -Level INFO
-        
-        try {
-            if ($credential) {
-                $session = New-PSSession -ComputerName $ComputerName -Credential $credential -ErrorAction Stop
+
+            if (-not (Test-ComputerOnline -ComputerName $singleHost)) {
+                Write-Log "Target '$singleHost' did not pass online check. Execution will continue and may fail on session creation." -Level WARNING
             }
-            else {
-                $session = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
+
+            $finalResults = Invoke-Deployment -Machines @($singleHost) -InstallerFile $installer -Credential $credential -ThrottleLimit 1 -InteractiveRetries $true
+            $collapsed = Get-FinalResultPerMachine -AllResults $finalResults
+            Write-Summary -FinalResults $collapsed -RunStart $runStart
+
+            $failedFinal = @($collapsed | Where-Object { $_.Status -eq 'Failed' })
+            if ($failedFinal.Count -gt 0) {
+                return 1
             }
-            Write-Log "Remote session created successfully." -Level SUCCESS
+
+            return 0
         }
-        catch {
-            # if we failed because of access, try acquiring credentials and retry once
-            if ($_.Exception.Message -match 'Access is denied' -or $_.Exception.Message -match 'permission') {
-                Write-Log "Session creation failed due to permissions. Prompting for credentials again..." -Level WARNING
-                $credential = Get-SessionCredentials -ComputerName $ComputerName
-                if ($credential) {
-                    try {
-                        $session = New-PSSession -ComputerName $ComputerName -Credential $credential -ErrorAction Stop
-                        Write-Log "Remote session created successfully with alternate credentials." -Level SUCCESS
-                    }
-                    catch {
-                        throw "Failed to create remote session even after prompting for credentials: $($_.Exception.Message)"
-                    }
-                }
-                else {
-                    throw "Could not obtain valid credentials for remote session."
-                }
+
+        # Batch mode
+        $machineListFile = Find-BatchMachineFile
+        Write-Log "Batch machine file selected: $machineListFile" -Level INFO
+
+        $rawBatchMachines = Get-MachineNamesFromFile -FilePath $machineListFile
+        if ($rawBatchMachines.Count -eq 0) {
+            throw 'No valid machine names found in the selected file.'
+        }
+
+        $probeMachine = $rawBatchMachines[0]
+        $credential = Get-ValidatedCredentialForProbe -ProbeComputer $probeMachine
+
+        Write-Log 'Starting AD and online pre-validation for batch list.' -Level INFO
+        $validatedMachines = Get-ValidatedBatchMachines -InputMachines $rawBatchMachines
+
+        if ($validatedMachines.Count -eq 0) {
+            throw 'No machines passed AD/online pre-validation.'
+        }
+
+        Write-Host "`nValidated machines ready for execution: $($validatedMachines.Count)" -ForegroundColor Cyan
+        while ($true) {
+            $parallelInput = (Read-Host 'Enter parallel thread count (1 for sequential)').Trim()
+            $parallelCount = 0
+            if ([int]::TryParse($parallelInput, [ref]$parallelCount) -and $parallelCount -ge 1) {
+                break
             }
-            else {
-                throw "Failed to create remote session: $($_.Exception.Message)"
-            }
+            Write-Log 'Invalid value. Enter a whole number >= 1.' -Level WARNING
         }
-        
-        # ====================================================================
-        # PHASE 5: PREPARE REMOTE ENVIRONMENT
-        # ====================================================================
-        
-        Write-Log "Preparing remote environment..." -Level INFO
-        
-        try {
-            Invoke-Command -Session $session -ScriptBlock {
-                param($TempPath)
-                
-                if (-not (Test-Path -Path $TempPath)) {
-                    New-Item -Path $TempPath -ItemType Directory -Force | Out-Null
-                }
-            } -ArgumentList $RemoteTempPath
-            
-            Write-Log "Remote temp directory ready." -Level SUCCESS
+
+        if ($parallelCount -gt 1 -and $PSVersionTable.PSVersion.Major -lt 7) {
+            Write-Log 'Parallel execution requested while current host is below PowerShell 7. Switching to sequential mode (throttle=1).' -Level WARNING
+            $parallelCount = 1
         }
-        catch {
-            throw "Failed to prepare remote environment: $($_.Exception.Message)"
+
+        Write-Log "Execution configured for $($validatedMachines.Count) machine(s) with throttle=$parallelCount." -Level INFO
+
+        $allResults = Invoke-Deployment -Machines $validatedMachines -InstallerFile $installer -Credential $credential -ThrottleLimit $parallelCount -InteractiveRetries $true
+        $finalPerMachine = Get-FinalResultPerMachine -AllResults $allResults
+
+        $successfulMachines = @($finalPerMachine | Where-Object { $_.Status -eq 'Success' } | Select-Object -ExpandProperty MachineName)
+        Update-BatchFileForSuccesses -FilePath $machineListFile -SuccessfulMachines $successfulMachines
+
+        Write-Summary -FinalResults $finalPerMachine -RunStart $runStart
+
+        $failedFinalBatch = @($finalPerMachine | Where-Object { $_.Status -eq 'Failed' })
+        if ($failedFinalBatch.Count -gt 0) {
+            return 1
         }
-        
-        # ====================================================================
-        # PHASE 6: COPY MSI TO REMOTE MACHINE
-        # ====================================================================
-        
-        $remoteMSIPath = Join-Path -Path $RemoteTempPath -ChildPath $msiFile.Name
-        
-        Write-Log "Copying MSI to remote machine ($remoteMSIPath)..." -Level INFO
-        
-        try {
-            Copy-Item -Path $localMSIFullPath -Destination $remoteMSIPath -ToSession $session -Force -ErrorAction Stop
-            Write-Log "MSI copied successfully." -Level SUCCESS
-        }
-        catch {
-            throw "Failed to copy MSI to remote machine: $($_.Exception.Message)"
-        }
-        
-        # ====================================================================
-        # PHASE 7: EXECUTE INSTALLATION
-        # ====================================================================
-        
-        $exitCode = Install-RemoteMSI -Session $session -RemoteMSIPath $remoteMSIPath
-        
-        if ($null -eq $exitCode) {
-            throw "Installation failed or was cancelled."
-        }
-        
-        Write-Log "MSI installation completed with exit code: $exitCode" -Level INFO
-        
-        # MSI exit codes: 0 = success, 3010 = success but restart required
-        if ($exitCode -eq 0) {
-            Write-Log "Installation completed successfully (no restart required)." -Level SUCCESS
-            $installSuccess = $true
-            $rebootNeeded = $false
-        }
-        elseif ($exitCode -eq 3010) {
-            Write-Log "Installation successful but system reboot required." -Level SUCCESS
-            $installSuccess = $true
-            $rebootNeeded = $true
-        }
-        else {
-            throw "Installation failed with exit code $exitCode"
-        }
-        
-        # ====================================================================
-        # PHASE 8: CHECK FOR PENDING REBOOT
-        # ====================================================================
-        
-        $pendingReboot = Test-PendingReboot -Session $session
-        $rebootNeeded = $rebootNeeded -or $pendingReboot
-        
-        # ====================================================================
-        # PHASE 9: CLEANUP & RESULTS
-        # ====================================================================
-        
-        if ($installSuccess) {
-            Write-Log "Cleaning up remote installation files..." -Level INFO
-            Remove-RemoteFile -Session $session -FilePath $remoteMSIPath
-        }
-        else {
-            Write-Log "Keeping MSI on remote machine due to installation failure." -Level WARNING
-        }
-        
-        # ====================================================================
-        # FINAL STATUS & LOGGING
-        # ====================================================================
-        
-        Write-Host "`n" + ("=" * 70)
-        Write-Host "Installation Summary" -ForegroundColor Cyan
-        Write-Host ("=" * 70)
-        
-        if ($installSuccess) {
-            Write-Log "Installation SUCCESSFUL on $ComputerName" -Level SUCCESS
-            
-            if ($rebootNeeded) {
-                Write-Host "Status: SUCCESS - Reboot Required" -ForegroundColor Yellow
-                Write-Log "Note: Machine requires a system reboot to complete installation." -Level WARNING
-            }
-            else {
-                Write-Host "Status: SUCCESS - No Reboot Required" -ForegroundColor Green
-            }
-            
-            # Rename log to Success
-            $successLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Success.log"
-            if (Test-Path $LogPath) {
-                Move-Item -Path $LogPath -Destination $successLog -Force
-                $LogPath = $successLog
-            }
-        }
-        else {
-            Write-Host "Status: FAILED" -ForegroundColor Red
-            Write-Log "Installation FAILED on $ComputerName - MSI preserved for troubleshooting." -Level ERROR
-            
-            # Rename log to Failure
-            $failureLog = Join-Path -Path $LogDirectory -ChildPath "${baseLogName}_Failure.log"
-            if (Test-Path $LogPath) {
-                Move-Item -Path $LogPath -Destination $failureLog -Force
-                $LogPath = $failureLog
-            }
-        }
-        
-        Write-Host "Log File: $LogPath" -ForegroundColor Cyan
-        Write-Host ("=" * 70) + "`n"
-        
-        # Clean up session
-        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
-        
-        if (-not $installSuccess) {
-            exit 1
-        }
+
+        return 0
     }
     catch {
         Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
-        
-        # Ensure log file is renamed to Failure if we have a LogPath
-        if ($LogPath -and (Test-Path $LogPath)) {
-            $failureLog = $LogPath -replace '_Incomplete\.log$', '_Failure.log'
-            Move-Item -Path $LogPath -Destination $failureLog -Force -ErrorAction SilentlyContinue
-        }
-        
-        Write-Host "`n[INSTALLATION FAILED]" -ForegroundColor Red
-        exit 1
+        Write-Host "`n[DEPLOYMENT FAILED]" -ForegroundColor Red
+        Write-Host "Log File: $script:LogPath" -ForegroundColor Yellow
+        return 1
     }
 }
 
-# Execute main function
-Main
+$finalExitCode = Main
 
-# When the script is launched from Explorer (double‑click), the PowerShell window
-# will close immediately once the script ends.  A simple pause gives users a
-# chance to read any error messages or credential prompts before the window
-# disappears.  The prompt is harmless when running from an existing console.
 Write-Host "`nScript execution finished. Press Enter to close this window..."
 Read-Host | Out-Null
+
+exit $finalExitCode
 
 
 
