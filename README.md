@@ -4,7 +4,8 @@
 `Install-RemoteMSI.ps1` performs silent remote MSI/MSIX deployment to Windows machines in single-machine or batch mode.
 
 Core behaviors:
-- Validates credentials early using a probe machine
+- Validates credentials early against domain services (AD/DC)
+- Always shows the current execution account and prompts to switch credentials
 - Uses terminal-only credential prompts (`Read-Host`, no GUI dialogs)
 - Sanitizes hostnames before use
 - Auto-discovers batch source files (`.txt`, `.csv`) from script directory
@@ -17,9 +18,17 @@ Core behaviors:
 
 ### Security and Validation
 - Credential-first workflow (before heavy batch processing)
-- Remote admin verification during credential probe
+- Domain-auth credential verification (2 attempts max by default)
+- Identity confirmation prompt appears every run before authorization checks
 - Hostname sanitization for both single and batch modes
-- AD/DNS and online pre-validation for batch targets
+- Five-state machine pre-validation for batch targets:
+	- Invalid machine name (not found in AD/DC)
+	- Valid in AD/DC, DNS returns no IP
+	- Valid name + IP, but unreachable by connection tests
+	- Reachable host, but WinRM/PS-Remoting unavailable
+	- Fully reachable (eligible for deployment)
+- Batch pre-validation displays in-place status updates during state evaluation
+- Authorization canary check validates remote-admin access on up to 3 ready machines before deployment
 - Runtime startup gate for PowerShell host/version capability
 
 ### Batch Execution
@@ -73,10 +82,12 @@ Unattended/non-interactive mode:
 Interactive flow:
 1. Select mode (`Single` or `Batch`)
 2. Provide hostname or batch source file
-3. Validate credentials with probe machine
-4. Select installer file
-5. Execute deployment (parallel prompt in batch mode)
-6. Handle retry prompts for failed machines only
+3. Validate credentials against AD/DC
+4. Confirm current execution account and optionally switch to alternate credentials
+5. Select installer file
+6. Run five-state pre-validation plus authorization canary check (up to 3 ready machines)
+7. Execute deployment for fully reachable machines (parallel prompt in batch mode)
+8. Handle retry prompts for failed machines only
 
 ---
 
@@ -93,4 +104,6 @@ Interactive flow:
 - If PS7 is missing (interactive), script can optionally attempt install through configured Windows Update service.
 - If PS7 install is unavailable/fails, script continues with fallback behavior.
 - `-NonInteractive` suppresses interactive runtime prompts where applicable.
+- Batch mode fails fast when no machines are fully reachable after pre-validation, and prints a machine-state summary table for all parsed targets before exit.
+- If authorization canary fails, deployment is stopped before install execution starts.
 - Quiet MSI execution does not provide reliable real-time progress percentages; status is tracked operationally by job state and final exit code.

@@ -19,14 +19,16 @@ Production PowerShell deployment script for remote MSI/MSIX installs with robust
 
 High-level flow:
 1. Runtime host bootstrap check (PS version, optional PS7 relaunch/install path)
-2. Credential probe/validation on a machine before heavy processing
-3. Target sanitization and batch pre-validation (AD/DNS + online)
-4. Installer selection from script directory
-5. Transfer with retry policy (`5s`, `10s`, `30s`, `60s`)
-6. Silent install (`msiexec /quiet /norestart`)
-7. Install result normalization (exit descriptions + final per-machine result)
-8. Failed-machine-only retry rounds
-9. Summary table + one aggregated run log
+2. Credential validation against domain services (AD/DC) before heavy processing
+3. Operator account confirmation prompt (shows active account, optional credential override)
+4. Target sanitization and five-state batch pre-validation (AD/DNS/reachability/WinRM)
+5. Authorization canary check on up to 3 ready machines
+6. Installer selection from script directory
+7. Transfer with retry policy (`5s`, `10s`, `30s`, `60s`)
+8. Silent install (`msiexec /quiet /norestart`)
+9. Install result normalization (exit descriptions + final per-machine result)
+10. Failed-machine-only retry rounds
+11. Summary table + one aggregated run log
 
 ---
 
@@ -55,9 +57,11 @@ Primary functions:
 | `Get-ValidatedSingleHostname` | Single-target input + sanitization |
 | `Find-BatchMachineFile` | Batch file discovery / selection |
 | `Get-MachineNamesFromFile` | First-column parsing + sanitization |
-| `Get-ValidatedBatchMachines` | AD/DNS + online pre-validation |
+| `Get-MachineAvailabilityReport` | Five-state machine validation + ready-target extraction |
 | `Request-Credentials` | Terminal `Read-Host` credential prompt |
-| `Get-ValidatedCredentialForProbe` | Early credential + remote-admin validation |
+| `Get-ValidatedCredentialForDomain` | Early AD/DC credential validation |
+| `Get-CredentialAfterUserConfirmation` | Always-on account prompt + optional credential override |
+| `Invoke-AuthorizationCanaryCheck` | Preflight remote-admin authorization check (up to 3 machines) |
 | `Copy-MSIWithRetry` | Retry transfer policy and operator retry/abort prompt |
 | `Get-PendingRebootState` | Reads reboot indicators (registry + WMI) |
 | `Get-RebootRequirementEvaluation` | Determines install-caused reboot required (Yes/No) |
@@ -76,13 +80,15 @@ PHASE 0: Runtime bootstrap (PS host/version gate)
 PHASE 1: Installer file verification/selection
 PHASE 2: Mode selection (Single/Batch)
 PHASE 3: Target input + sanitization
-PHASE 4: Credential validation first (probe machine)
-PHASE 5: Batch pre-validation (AD/DNS + online) when in batch mode
-PHASE 6: Session creation + remote temp prep
-PHASE 7: Transfer with retry policy
-PHASE 8: Silent install and exit code capture
-PHASE 9: Install-caused reboot evaluation (pre/post snapshot compare)
-PHASE 10: Cleanup, per-machine retries, summary, and logging
+PHASE 4: Credential validation first (AD/DC)
+PHASE 5: Operator account confirmation (optional credential override)
+PHASE 6: Batch pre-validation by five machine-availability states
+PHASE 7: Authorization canary check on up to 3 ready machines
+PHASE 8: Session creation + remote temp prep
+PHASE 9: Transfer with retry policy
+PHASE 10: Silent install and exit code capture
+PHASE 11: Install-caused reboot evaluation (pre/post snapshot compare)
+PHASE 12: Cleanup, per-machine retries, summary, and logging
 ```
 
 ---
@@ -93,7 +99,7 @@ PHASE 10: Cleanup, per-machine retries, summary, and logging
 2. Credential prompts are terminal-based (`Read-Host`) only.
 3. Hostname sanitization applies to single and batch modes.
 4. Batch file parsing uses first column; header not required.
-5. Batch pre-validation is done before deployment workers start.
+5. Batch pre-validation is done before deployment workers start and excludes non-ready states.
 6. Transfer retry delays are fixed: `5,10,30,60` seconds.
 7. Failed machine retries occur after each batch and only for failed targets.
 8. MSI retention policy: preserve on most failures; remove on success and corruption/open failure (`1619`).
@@ -101,15 +107,24 @@ PHASE 10: Cleanup, per-machine retries, summary, and logging
 10. PS7 startup gate remains in place; fallback behavior preserved.
 11. Optional PS7 install via configured Windows Update service remains available in interactive runs.
 12. Reboot summary/reporting is installation-only `Yes/No` (pre-existing reboot not counted).
+13. Credential pre-check is domain-auth based (not probe-machine endpoint based).
+14. Batch mode fails fast if no machine is fully reachable after pre-validation.
+15. Operator is always shown active execution account and can choose alternate credentials before canary/deployment.
+16. Authorization canary validates remote-admin rights on up to 3 ready machines before deployment starts.
+17. Batch pre-validation emits in-place status updates (non-animated) and uses the operator-facing wording: "Executing machine-state validation for batch processing list."
+18. If pre-validation yields zero ready machines, script prints a machine-state summary table (all parsed machines + derived state) before terminating.
 
 ---
 
 ## Known Behaviors / Notes
 
 - Parallel execution requires PowerShell 7+; script falls back to sequential when unavailable.
-- Console uses spinner-style progress for install/batch activity in long-running operations.
+- Console uses animated spinner progress for installer execution and in-place status updates for batch pre-validation.
 - Quiet MSI execution does not provide reliable granular percentage progress.
 - Aggregated run log is reused across PS5→PS7 relaunch path via `-RunLogPath`.
+- Reachability-only machines with WinRM disabled are excluded before deployment.
+- Authorization canary failure stops deployment before install execution begins.
+- Zero-ready pre-validation now renders a summary table so operators can review derived state per machine even when no install jobs run.
 
 ---
 
@@ -140,7 +155,12 @@ Remote machine prerequisites:
 
 - [ ] Single mode success path (exit `0`) works end-to-end
 - [ ] Batch mode with mixed success/failure behaves correctly
-- [ ] Credential probe rejects non-admin remote rights
+- [ ] Domain credential validation rejects invalid credentials within 2 attempts
+- [ ] Account confirmation prompt always displays active execution identity
+- [ ] Batch pre-validation correctly classifies all five machine states
+- [ ] In-place pre-validation status updates appear after the operator-facing validation message
+- [ ] If zero machines are ready after pre-validation, summary table still lists all machines with derived state
+- [ ] Authorization canary checks up to 3 machines and blocks deployment on failure
 - [ ] Transfer retry and retry-cycle prompt works
 - [ ] Failed-machine-only retry prompt logic works
 - [ ] Reboot column is `Yes` only for install-caused reboot requirement

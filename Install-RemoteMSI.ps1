@@ -4,10 +4,10 @@
 
 .DESCRIPTION
     Supports single-machine and batch execution with:
-    - Credential validation before heavy processing
+    - Domain credential validation before heavy processing
     - Hostname sanitization
     - Batch input file discovery (CSV/TXT)
-    - AD and online pre-validation for batch lists
+    - Five-state machine pre-validation (AD/DNS/reachability/WinRM)
     - Throttled parallel installation batches
     - File transfer retry policy (5s, 10s, 30s, 60s)
     - Per-machine retry rounds after each batch (failed machines only)
@@ -169,6 +169,42 @@ function Test-ComputerOnline {
 
         $ping = Test-Connection -TargetName $ComputerName -Quiet -Count 1 -TimeoutSeconds 5
         return [bool]$ping
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-ComputerIPAddresses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName
+    )
+
+    try {
+        $records = Resolve-DnsName -Name $ComputerName -ErrorAction Stop
+        $ips = @(
+            $records |
+                Where-Object { $_.IPAddress -and $_.Type -in @('A', 'AAAA') } |
+                Select-Object -ExpandProperty IPAddress -Unique
+        )
+
+        return @($ips)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Test-ComputerWinRM {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName
+    )
+
+    try {
+        Test-WSMan -ComputerName $ComputerName -ErrorAction Stop | Out-Null
+        return $true
     }
     catch {
         return $false
@@ -635,57 +671,273 @@ function Test-RemoteAdmin {
     return [bool]$isAdmin
 }
 
-function Get-ValidatedCredentialForProbe {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ProbeComputer
-    )
-
-    Write-Log "Validating credentials first using probe machine '$ProbeComputer'." -Level INFO
-
+function Test-CurrentUserDomainAuth {
     try {
-        $probeSession = New-PSSession -ComputerName $ProbeComputer -ErrorAction Stop
-        $probeAdmin = Test-RemoteAdmin -Session $probeSession
-        Remove-PSSession -Session $probeSession -ErrorAction SilentlyContinue
-
-        if ($probeAdmin) {
-            Write-Log 'Current user credentials validated successfully (remote admin confirmed).' -Level SUCCESS
-            return $null
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -eq $currentIdentity -or [string]::IsNullOrWhiteSpace($currentIdentity.Name)) {
+            return $false
         }
 
-        Write-Log 'Current user can connect but is not remote administrator. Prompting for credentials.' -Level WARNING
+        if (-not ($currentIdentity.Name.Contains('\'))) {
+            return $false
+        }
+
+        $rootDse = [ADSI]'LDAP://RootDSE'
+        $defaultNamingContext = [string]$rootDse.defaultNamingContext
+        return -not [string]::IsNullOrWhiteSpace($defaultNamingContext)
     }
     catch {
-        Write-Log "Current user credential probe failed: $($_.Exception.Message)" -Level WARNING
+        return $false
+    }
+}
+
+function Test-DomainCredential {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscredential]$Credential
+    )
+
+    $result = [pscustomobject]@{
+        IsValid = $false
+        Message = ''
+    }
+
+    try {
+        $userNameRaw = [string]$Credential.UserName
+        if ([string]::IsNullOrWhiteSpace($userNameRaw)) {
+            $result.Message = 'Username is empty.'
+            return $result
+        }
+
+        $userNameRaw = $userNameRaw.Trim()
+        $domainName = $null
+        $userNameForValidate = $userNameRaw
+
+        if ($userNameRaw -match '^(?<domain>[^\\]+)\\(?<user>.+)$') {
+            $domainName = $Matches['domain']
+            $userNameForValidate = $Matches['user']
+        }
+        elseif ($userNameRaw -match '^(?<user>[^@]+)@(?<domain>.+)$') {
+            $domainName = $Matches['domain']
+            $userNameForValidate = $Matches['user']
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
+                $domainName = $env:USERDNSDOMAIN
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+                $domainName = $env:USERDOMAIN
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($domainName)) {
+            $result.Message = 'Could not determine domain for credential validation. Use DOMAIN\User or User@Domain.'
+            return $result
+        }
+
+        $securePtr = [IntPtr]::Zero
+        try {
+            $securePtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($securePtr)
+
+            $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                [System.DirectoryServices.AccountManagement.ContextType]::Domain,
+                $domainName
+            )
+
+            try {
+                $isValid = $context.ValidateCredentials(
+                    $userNameForValidate,
+                    $plainPassword,
+                    [System.DirectoryServices.AccountManagement.ContextOptions]::Negotiate
+                )
+
+                $result.IsValid = [bool]$isValid
+                if ($result.IsValid) {
+                    $result.Message = "Domain credential authentication succeeded for '$userNameRaw'."
+                }
+                else {
+                    $result.Message = "Domain credential authentication failed for '$userNameRaw'."
+                }
+            }
+            finally {
+                if ($context) {
+                    $context.Dispose()
+                }
+            }
+        }
+        finally {
+            if ($securePtr -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($securePtr)
+            }
+        }
+    }
+    catch {
+        $result.Message = "Domain credential validation error: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Get-ValidatedCredentialForDomain {
+    Write-Log 'Validating credentials against domain services before deployment.' -Level INFO
+
+    if (Test-CurrentUserDomainAuth) {
+        Write-Log 'Current user domain authentication validated successfully.' -Level SUCCESS
+        return $null
+    }
+
+    Write-Log 'Current user domain authentication could not be validated. Prompting for explicit credentials.' -Level WARNING
+
+    $attempt = 0
+    while ($attempt -lt $MaxCredentialAttempts) {
+        $attempt++
+        $credential = Request-Credentials -Message "Enter domain administrator credentials (attempt $attempt of $MaxCredentialAttempts)"
+        if ($null -eq $credential) {
+            throw 'Credential entry cancelled.'
+        }
+
+        $validationResult = Test-DomainCredential -Credential $credential
+        if ($validationResult.IsValid) {
+            Write-Log $validationResult.Message -Level SUCCESS
+            return $credential
+        }
+
+        Write-Log $validationResult.Message -Level WARNING
+    }
+
+    throw "Failed to validate domain credentials after $MaxCredentialAttempts attempts."
+}
+
+function Get-EffectiveCredentialIdentity {
+    param(
+        [Parameter(Mandatory = $false)]
+        [pscredential]$Credential
+    )
+
+    if ($Credential -and -not [string]::IsNullOrWhiteSpace($Credential.UserName)) {
+        return $Credential.UserName
+    }
+
+    try {
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($currentIdentity -and -not [string]::IsNullOrWhiteSpace($currentIdentity.Name)) {
+            return $currentIdentity.Name
+        }
+    }
+    catch {
+        # ignore and fallback
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN) -and -not [string]::IsNullOrWhiteSpace($env:USERNAME)) {
+        return "$($env:USERDOMAIN)\$($env:USERNAME)"
+    }
+
+    return 'UnknownIdentity'
+}
+
+function Get-CredentialAfterUserConfirmation {
+    param(
+        [Parameter(Mandatory = $false)]
+        [pscredential]$CurrentCredential
+    )
+
+    $effectiveIdentity = Get-EffectiveCredentialIdentity -Credential $CurrentCredential
+    Write-Log "Current account selected for remote execution: '$effectiveIdentity'." -Level INFO
+
+    if (-not (Test-IsInteractiveSession)) {
+        Write-Log 'Non-interactive session detected. Skipping credential switch prompt and continuing with selected account.' -Level WARNING
+        return $CurrentCredential
+    }
+
+    $useAlternate = Read-YesNoChoice -Prompt "Current account is '$effectiveIdentity'. Use alternate credentials for remote execution?" -DefaultYes $false
+    if (-not $useAlternate) {
+        Write-Log "Operator accepted current account '$effectiveIdentity' for execution." -Level INFO
+        return $CurrentCredential
     }
 
     $attempt = 0
     while ($attempt -lt $MaxCredentialAttempts) {
         $attempt++
-        $credential = Request-Credentials -Message "Enter administrator credentials for $ProbeComputer (attempt $attempt of $MaxCredentialAttempts)"
-        if ($null -eq $credential) {
+        $alternateCredential = Request-Credentials -Message "Enter alternate domain credentials (attempt $attempt of $MaxCredentialAttempts)"
+        if ($null -eq $alternateCredential) {
             throw 'Credential entry cancelled.'
         }
 
-        try {
-            $testSession = New-PSSession -ComputerName $ProbeComputer -Credential $credential -ErrorAction Stop
-            $isAdmin = Test-RemoteAdmin -Session $testSession
-            Remove-PSSession -Session $testSession -ErrorAction SilentlyContinue
-
-            if (-not $isAdmin) {
-                Write-Log 'Credentials authenticated but are not local admin on probe machine.' -Level WARNING
-                continue
-            }
-
-            Write-Log 'Provided credentials validated successfully.' -Level SUCCESS
-            return $credential
+        $validationResult = Test-DomainCredential -Credential $alternateCredential
+        if ($validationResult.IsValid) {
+            Write-Log $validationResult.Message -Level SUCCESS
+            Write-Log "Operator switched execution account to '$($alternateCredential.UserName)'." -Level INFO
+            return $alternateCredential
         }
-        catch {
-            Write-Log "Credential validation failed: $($_.Exception.Message)" -Level WARNING
+
+        Write-Log $validationResult.Message -Level WARNING
+    }
+
+    throw "Failed to validate alternate domain credentials after $MaxCredentialAttempts attempts."
+}
+
+function Invoke-AuthorizationCanaryCheck {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ReadyMachines,
+
+        [Parameter(Mandatory = $false)]
+        [pscredential]$Credential,
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxCanaryMachines = 3
+    )
+
+    if ($ReadyMachines.Count -eq 0) {
+        return [pscustomobject]@{
+            Success = $false
+            TestedMachines = @()
+            FailedChecks = @('No ready machines available for authorization canary check.')
         }
     }
 
-    throw "Failed to validate credentials after $MaxCredentialAttempts attempts."
+    $canaryCount = [Math]::Min([Math]::Max($MaxCanaryMachines, 1), $ReadyMachines.Count)
+    $testedMachines = @($ReadyMachines | Select-Object -First $canaryCount)
+
+    Write-Log "Running authorization canary check on $canaryCount machine(s): $($testedMachines -join ', ')." -Level INFO
+
+    $failedChecks = New-Object System.Collections.Generic.List[string]
+    foreach ($machine in $testedMachines) {
+        $session = $null
+        try {
+            if ($Credential) {
+                $session = New-PSSession -ComputerName $machine -Credential $Credential -ErrorAction Stop
+            }
+            else {
+                $session = New-PSSession -ComputerName $machine -ErrorAction Stop
+            }
+
+            $isAdmin = Test-RemoteAdmin -Session $session
+            if (-not $isAdmin) {
+                $failedChecks.Add("${machine}: Connected, but account is not local administrator.")
+                Write-Log "[$machine] Canary authorization failed: account is not local administrator." -Level WARNING
+                continue
+            }
+
+            Write-Log "[$machine] Canary authorization succeeded (remote admin confirmed)." -Level SUCCESS
+        }
+        catch {
+            $failedChecks.Add("${machine}: $($_.Exception.Message)")
+            Write-Log "[$machine] Canary authorization failed: $($_.Exception.Message)" -Level WARNING
+        }
+        finally {
+            if ($session) {
+                Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $failedChecks.Count -eq 0
+        TestedMachines = $testedMachines
+        FailedChecks = @($failedChecks)
+    }
 }
 
 # ============================================================================
@@ -776,41 +1028,233 @@ function Get-MachineNamesFromFile {
     return @($uniqueMachines)
 }
 
-function Get-ValidatedBatchMachines {
+function Get-MachineAvailabilityReport {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$InputMachines
+        [string[]]$InputMachines,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ShowProgressSpinner = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ProgressMessage = 'Machine-state validation in progress'
     )
 
-    $validMachines = New-Object System.Collections.Generic.List[string]
+    $readyMachines = New-Object System.Collections.Generic.List[string]
     $notInAD = New-Object System.Collections.Generic.List[string]
-    $offline = New-Object System.Collections.Generic.List[string]
+    $noDnsIp = New-Object System.Collections.Generic.List[string]
+    $unreachable = New-Object System.Collections.Generic.List[string]
+    $winRmUnavailable = New-Object System.Collections.Generic.List[string]
+    $machineStates = New-Object System.Collections.Generic.List[object]
+
+    # spinner animation removed because checks are blocking; we only display a static status line
+    $totalMachines = $InputMachines.Count
+    $machineIndex = 0
+    $spinnerState = @{ LastLength = 0 }
+
+    function Write-SpinnerStatusLine {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Text,
+
+            [Parameter(Mandatory = $false)]
+            [string]$Color = 'Cyan',
+
+            [Parameter(Mandatory = $false)]
+            [bool]$TerminateLine = $false
+        )
+
+        $padLength = [Math]::Max($spinnerState.LastLength - $Text.Length, 0)
+        $padding = if ($padLength -gt 0) { ' ' * $padLength } else { '' }
+
+        if ($TerminateLine) {
+            Write-Host "`r$Text$padding" -ForegroundColor $Color
+            $spinnerState.LastLength = 0
+        }
+        else {
+            Write-Host "`r$Text$padding" -NoNewline -ForegroundColor $Color
+            $spinnerState.LastLength = $Text.Length
+        }
+    }
+
+    function Update-ValidationSpinner {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Stage
+        )
+
+        if (-not $ShowProgressSpinner) {
+            return
+        }
+
+        $displayIndex = [Math]::Min($machineIndex + 1, [Math]::Max($totalMachines, 1))
+        Write-SpinnerStatusLine -Text "$ProgressMessage [$displayIndex/$totalMachines] $Stage"
+    }
 
     foreach ($machine in $InputMachines) {
+        Update-ValidationSpinner -Stage "Evaluating $machine"
+        Update-ValidationSpinner -Stage "[$machine] AD"
+
         if (-not (Test-ComputerInAD -ComputerName $machine)) {
             $notInAD.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'InvalidNameNotInAD' })
+            $machineIndex++
             continue
         }
 
+        Update-ValidationSpinner -Stage "[$machine] DNS"
+        $ips = Resolve-ComputerIPAddresses -ComputerName $machine
+        if ($ips.Count -eq 0) {
+            $noDnsIp.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ValidNoDNSIP' })
+            $machineIndex++
+            continue
+        }
+
+        Update-ValidationSpinner -Stage "[$machine] Reachability"
         if (-not (Test-ComputerOnline -ComputerName $machine)) {
-            $offline.Add($machine)
+            $unreachable.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ReachabilityFailed' })
+            $machineIndex++
             continue
         }
 
-        $validMachines.Add($machine)
+        Update-ValidationSpinner -Stage "[$machine] WinRM"
+        if (-not (Test-ComputerWinRM -ComputerName $machine)) {
+            $winRmUnavailable.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'WinRMUnavailable' })
+            $machineIndex++
+            continue
+        }
+
+        $readyMachines.Add($machine)
+        $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ReadyMachines' })
+        $machineIndex++
     }
 
-    Write-Log "Pre-validation summary: Total=$($InputMachines.Count), Valid=$($validMachines.Count), NotInAD=$($notInAD.Count), Offline=$($offline.Count)" -Level INFO
+    if ($ShowProgressSpinner -and $totalMachines -gt 0) {
+        Write-SpinnerStatusLine -Text "$ProgressMessage completed ($totalMachines/$totalMachines)" -TerminateLine $true
+    }
+
+    Write-Log "Pre-validation summary: Total=$($InputMachines.Count), Ready=$($readyMachines.Count), InvalidNameNotInAD=$($notInAD.Count), ValidNoDNSIP=$($noDnsIp.Count), ReachabilityFailed=$($unreachable.Count), WinRMDisabled=$($winRmUnavailable.Count)" -Level INFO
 
     if ($notInAD.Count -gt 0) {
-        Write-Log "Excluded (Not in AD/DNS): $($notInAD -join ', ')" -Level WARNING
+        Write-Log "Excluded (Invalid machine name - not found in AD/DC): $($notInAD -join ', ')" -Level WARNING
     }
 
-    if ($offline.Count -gt 0) {
-        Write-Log "Excluded (Offline): $($offline -join ', ')" -Level WARNING
+    if ($noDnsIp.Count -gt 0) {
+        Write-Log "Excluded (Valid in AD/DC but DNS returned no IP): $($noDnsIp -join ', ')" -Level WARNING
     }
 
-    return @($validMachines)
+    if ($unreachable.Count -gt 0) {
+        Write-Log "Excluded (Valid name + IP, but unreachable by connection tests): $($unreachable -join ', ')" -Level WARNING
+    }
+
+    if ($winRmUnavailable.Count -gt 0) {
+        Write-Log "Excluded (Reachable host, but WinRM/PS-Remoting unavailable): $($winRmUnavailable -join ', ')" -Level WARNING
+    }
+
+    if ($readyMachines.Count -gt 0) {
+        Write-Log "Ready for deployment (fully reachable): $($readyMachines -join ', ')" -Level SUCCESS
+    }
+
+    return [pscustomobject]@{
+        ReadyMachines      = @($readyMachines)
+        InvalidNameNotInAD = @($notInAD)
+        ValidNoDNSIP       = @($noDnsIp)
+        ReachabilityFailed = @($unreachable)
+        WinRMUnavailable   = @($winRmUnavailable)
+        MachineStates      = $machineStates.ToArray()
+    }
+}
+
+function Write-MachineStateValidationSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$MachineStates,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStart
+    )
+
+    $normalizedStates = @($MachineStates)
+    $flattenedStates = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $normalizedStates) {
+        if ($entry -is [System.Collections.IEnumerable] -and -not ($entry -is [string]) -and -not ($entry -is [pscustomobject])) {
+            foreach ($nested in $entry) {
+                if ($null -ne $nested) {
+                    $flattenedStates.Add($nested)
+                }
+            }
+            continue
+        }
+
+        if ($null -ne $entry) {
+            $flattenedStates.Add($entry)
+        }
+    }
+
+    $states = $flattenedStates.ToArray()
+
+    $duration = New-TimeSpan -Start $RunStart -End (Get-Date)
+    $totalCount = $states.Count
+    $readyCount = @($states | Where-Object { $_.DerivedState -eq 'ReadyMachines' }).Count
+
+    Write-Host "`n" + ('=' * 70)
+    Write-Host 'Deployment Summary' -ForegroundColor Cyan
+    Write-Host ('=' * 70)
+    Write-Host 'OVERALL RESULT: FAILED' -ForegroundColor Red
+    Write-Host ('=' * 70)
+    Write-Host "Total Machines: $totalCount"
+    Write-Host "Successful: 0"
+    Write-Host "Failed: $totalCount"
+    Write-Host "Reboot Required: 0"
+    Write-Host "Total Duration: $([int]$duration.TotalMinutes)m $($duration.Seconds)s"
+    Write-Host "Log File: $script:LogPath"
+    Write-Host ('=' * 70)
+
+    $machineWidth = 22
+    $stateWidth = 43
+
+    $line = '+' + ('-' * $machineWidth) + '+' + ('-' * $stateWidth) + '+'
+    $header = "|{0}|{1}|" -f @(
+        'Machine'.PadRight($machineWidth),
+        'Derived State'.PadRight($stateWidth)
+    )
+
+    Write-Host ''
+    Write-Host 'Result Table' -ForegroundColor Cyan
+    Write-Host $line
+    Write-Host $header
+    Write-Host $line
+
+    foreach ($row in $states | Sort-Object -Property MachineName) {
+        $machineValue = [string]$row.MachineName
+        if ([string]::IsNullOrWhiteSpace($machineValue)) {
+            $machineValue = 'Unknown'
+        }
+        if ($machineValue.Length -gt $machineWidth) {
+            $machineValue = $machineValue.Substring(0, $machineWidth)
+        }
+
+        $stateValue = [string]$row.DerivedState
+        if ([string]::IsNullOrWhiteSpace($stateValue)) {
+            $stateValue = 'UnknownState'
+        }
+        if ($stateValue.Length -gt $stateWidth) {
+            $stateValue = $stateValue.Substring(0, $stateWidth)
+        }
+
+        $machineCell = $machineValue.PadRight($machineWidth)
+        $stateCell = $stateValue.PadRight($stateWidth)
+        $rowLine = "|$machineCell|$stateCell|"
+
+        $rowColor = if ($row.DerivedState -eq 'ReadyMachines') { 'Green' } else { 'Red' }
+        Write-Host $rowLine -ForegroundColor $rowColor
+    }
+
+    Write-Host $line
+    Write-Log "Pre-validation-only summary: Total=$totalCount, Ready=$readyCount, Excluded=$($totalCount - $readyCount), DurationSeconds=$([int]$duration.TotalSeconds)" -Level INFO
 }
 
 # ============================================================================
@@ -1829,14 +2273,33 @@ function Main {
             $singleHost = Get-ValidatedSingleHostname
             Write-Log "Single-machine mode selected for '$singleHost'." -Level INFO
 
-            $credential = Get-ValidatedCredentialForProbe -ProbeComputer $singleHost
+            $credential = Get-ValidatedCredentialForDomain
+            $credential = Get-CredentialAfterUserConfirmation -CurrentCredential $credential
 
-            if (-not (Test-ComputerInAD -ComputerName $singleHost)) {
-                throw "Target '$singleHost' failed AD/DNS validation."
+            $singleReport = Get-MachineAvailabilityReport -InputMachines @($singleHost)
+            if ($singleReport.ReadyMachines.Count -eq 0) {
+                if ($singleReport.InvalidNameNotInAD.Count -gt 0) {
+                    throw "Target '$singleHost' is invalid (not found in AD/DC)."
+                }
+
+                if ($singleReport.ValidNoDNSIP.Count -gt 0) {
+                    throw "Target '$singleHost' is valid in AD/DC but DNS returned no IP."
+                }
+
+                if ($singleReport.ReachabilityFailed.Count -gt 0) {
+                    throw "Target '$singleHost' has valid name/IP but is not reachable by connection tests."
+                }
+
+                if ($singleReport.WinRMUnavailable.Count -gt 0) {
+                    throw "Target '$singleHost' is reachable but WinRM/PS-Remoting is not enabled."
+                }
+
+                throw "Target '$singleHost' failed availability validation."
             }
 
-            if (-not (Test-ComputerOnline -ComputerName $singleHost)) {
-                Write-Log "Target '$singleHost' did not pass online check. Execution will continue and may fail on session creation." -Level WARNING
+            $singleCanary = Invoke-AuthorizationCanaryCheck -ReadyMachines @($singleHost) -Credential $credential -MaxCanaryMachines 3
+            if (-not $singleCanary.Success) {
+                throw "Authorization canary check failed for single-machine run: $($singleCanary.FailedChecks -join ' | ')"
             }
 
             $finalResults = Invoke-Deployment -Machines @($singleHost) -InstallerFile $installer -Credential $credential -ThrottleLimit 1 -InteractiveRetries $true
@@ -1860,14 +2323,21 @@ function Main {
             throw 'No valid machine names found in the selected file.'
         }
 
-        $probeMachine = $rawBatchMachines[0]
-        $credential = Get-ValidatedCredentialForProbe -ProbeComputer $probeMachine
+        $credential = Get-ValidatedCredentialForDomain
+        $credential = Get-CredentialAfterUserConfirmation -CurrentCredential $credential
 
-        Write-Log 'Starting AD and online pre-validation for batch list.' -Level INFO
-        $validatedMachines = Get-ValidatedBatchMachines -InputMachines $rawBatchMachines
+        Write-Log 'Executing machine-state validation for batch processing list.' -Level INFO
+        $availabilityReport = Get-MachineAvailabilityReport -InputMachines $rawBatchMachines -ShowProgressSpinner $true -ProgressMessage 'Machine-state validation in progress for batch processing list'
+        $validatedMachines = @($availabilityReport.ReadyMachines)
 
         if ($validatedMachines.Count -eq 0) {
-            throw 'No machines passed AD/online pre-validation.'
+            Write-MachineStateValidationSummary -MachineStates $availabilityReport.MachineStates -RunStart $runStart
+            throw 'No machines are fully reachable for deployment after pre-validation.'
+        }
+
+        $batchCanary = Invoke-AuthorizationCanaryCheck -ReadyMachines $validatedMachines -Credential $credential -MaxCanaryMachines 3
+        if (-not $batchCanary.Success) {
+            throw "Authorization canary check failed: $($batchCanary.FailedChecks -join ' | ')"
         }
 
         Write-Host "`nValidated machines ready for execution: $($validatedMachines.Count)" -ForegroundColor Cyan
