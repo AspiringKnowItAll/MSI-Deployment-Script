@@ -27,6 +27,7 @@ Core behaviors:
 	- Valid name + IP, but unreachable by connection tests
 	- Reachable host, but WinRM/PS-Remoting unavailable
 	- Fully reachable (eligible for deployment)
+- Batch pre-validation displays in-place status updates during state evaluation
 - Authorization canary check validates remote-admin access on up to 3 ready machines before deployment
 - Runtime startup gate for PowerShell host/version capability
 
@@ -103,6 +104,6 @@ Interactive flow:
 - If PS7 is missing (interactive), script can optionally attempt install through configured Windows Update service.
 - If PS7 install is unavailable/fails, script continues with fallback behavior.
 - `-NonInteractive` suppresses interactive runtime prompts where applicable.
-- Batch mode fails fast when no machines are fully reachable after pre-validation.
+- Batch mode fails fast when no machines are fully reachable after pre-validation, and prints a machine-state summary table for all parsed targets before exit.
 - If authorization canary fails, deployment is stopped before install execution starts.
 - Quiet MSI execution does not provide reliable real-time progress percentages; status is tracked operationally by job state and final exit code.

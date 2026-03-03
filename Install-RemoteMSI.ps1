@@ -1031,7 +1031,13 @@ function Get-MachineNamesFromFile {
 function Get-MachineAvailabilityReport {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$InputMachines
+        [string[]]$InputMachines,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ShowProgressSpinner = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ProgressMessage = 'Machine-state validation in progress'
     )
 
     $readyMachines = New-Object System.Collections.Generic.List[string]
@@ -1039,30 +1045,95 @@ function Get-MachineAvailabilityReport {
     $noDnsIp = New-Object System.Collections.Generic.List[string]
     $unreachable = New-Object System.Collections.Generic.List[string]
     $winRmUnavailable = New-Object System.Collections.Generic.List[string]
+    $machineStates = New-Object System.Collections.Generic.List[object]
+
+    # spinner animation removed because checks are blocking; we only display a static status line
+    $totalMachines = $InputMachines.Count
+    $machineIndex = 0
+    $spinnerState = @{ LastLength = 0 }
+
+    function Write-SpinnerStatusLine {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Text,
+
+            [Parameter(Mandatory = $false)]
+            [string]$Color = 'Cyan',
+
+            [Parameter(Mandatory = $false)]
+            [bool]$TerminateLine = $false
+        )
+
+        $padLength = [Math]::Max($spinnerState.LastLength - $Text.Length, 0)
+        $padding = if ($padLength -gt 0) { ' ' * $padLength } else { '' }
+
+        if ($TerminateLine) {
+            Write-Host "`r$Text$padding" -ForegroundColor $Color
+            $spinnerState.LastLength = 0
+        }
+        else {
+            Write-Host "`r$Text$padding" -NoNewline -ForegroundColor $Color
+            $spinnerState.LastLength = $Text.Length
+        }
+    }
+
+    function Update-ValidationSpinner {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Stage
+        )
+
+        if (-not $ShowProgressSpinner) {
+            return
+        }
+
+        $displayIndex = [Math]::Min($machineIndex + 1, [Math]::Max($totalMachines, 1))
+        Write-SpinnerStatusLine -Text "$ProgressMessage [$displayIndex/$totalMachines] $Stage"
+    }
 
     foreach ($machine in $InputMachines) {
+        Update-ValidationSpinner -Stage "Evaluating $machine"
+        Update-ValidationSpinner -Stage "[$machine] AD"
+
         if (-not (Test-ComputerInAD -ComputerName $machine)) {
             $notInAD.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'InvalidNameNotInAD' })
+            $machineIndex++
             continue
         }
 
+        Update-ValidationSpinner -Stage "[$machine] DNS"
         $ips = Resolve-ComputerIPAddresses -ComputerName $machine
         if ($ips.Count -eq 0) {
             $noDnsIp.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ValidNoDNSIP' })
+            $machineIndex++
             continue
         }
 
+        Update-ValidationSpinner -Stage "[$machine] Reachability"
         if (-not (Test-ComputerOnline -ComputerName $machine)) {
             $unreachable.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ReachabilityFailed' })
+            $machineIndex++
             continue
         }
 
+        Update-ValidationSpinner -Stage "[$machine] WinRM"
         if (-not (Test-ComputerWinRM -ComputerName $machine)) {
             $winRmUnavailable.Add($machine)
+            $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'WinRMUnavailable' })
+            $machineIndex++
             continue
         }
 
         $readyMachines.Add($machine)
+        $machineStates.Add([pscustomobject]@{ MachineName = $machine; DerivedState = 'ReadyMachines' })
+        $machineIndex++
+    }
+
+    if ($ShowProgressSpinner -and $totalMachines -gt 0) {
+        Write-SpinnerStatusLine -Text "$ProgressMessage completed ($totalMachines/$totalMachines)" -TerminateLine $true
     }
 
     Write-Log "Pre-validation summary: Total=$($InputMachines.Count), Ready=$($readyMachines.Count), InvalidNameNotInAD=$($notInAD.Count), ValidNoDNSIP=$($noDnsIp.Count), ReachabilityFailed=$($unreachable.Count), WinRMDisabled=$($winRmUnavailable.Count)" -Level INFO
@@ -1093,7 +1164,97 @@ function Get-MachineAvailabilityReport {
         ValidNoDNSIP       = @($noDnsIp)
         ReachabilityFailed = @($unreachable)
         WinRMUnavailable   = @($winRmUnavailable)
+        MachineStates      = $machineStates.ToArray()
     }
+}
+
+function Write-MachineStateValidationSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$MachineStates,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStart
+    )
+
+    $normalizedStates = @($MachineStates)
+    $flattenedStates = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $normalizedStates) {
+        if ($entry -is [System.Collections.IEnumerable] -and -not ($entry -is [string]) -and -not ($entry -is [pscustomobject])) {
+            foreach ($nested in $entry) {
+                if ($null -ne $nested) {
+                    $flattenedStates.Add($nested)
+                }
+            }
+            continue
+        }
+
+        if ($null -ne $entry) {
+            $flattenedStates.Add($entry)
+        }
+    }
+
+    $states = $flattenedStates.ToArray()
+
+    $duration = New-TimeSpan -Start $RunStart -End (Get-Date)
+    $totalCount = $states.Count
+    $readyCount = @($states | Where-Object { $_.DerivedState -eq 'ReadyMachines' }).Count
+
+    Write-Host "`n" + ('=' * 70)
+    Write-Host 'Deployment Summary' -ForegroundColor Cyan
+    Write-Host ('=' * 70)
+    Write-Host 'OVERALL RESULT: FAILED' -ForegroundColor Red
+    Write-Host ('=' * 70)
+    Write-Host "Total Machines: $totalCount"
+    Write-Host "Successful: 0"
+    Write-Host "Failed: $totalCount"
+    Write-Host "Reboot Required: 0"
+    Write-Host "Total Duration: $([int]$duration.TotalMinutes)m $($duration.Seconds)s"
+    Write-Host "Log File: $script:LogPath"
+    Write-Host ('=' * 70)
+
+    $machineWidth = 22
+    $stateWidth = 43
+
+    $line = '+' + ('-' * $machineWidth) + '+' + ('-' * $stateWidth) + '+'
+    $header = "|{0}|{1}|" -f @(
+        'Machine'.PadRight($machineWidth),
+        'Derived State'.PadRight($stateWidth)
+    )
+
+    Write-Host ''
+    Write-Host 'Result Table' -ForegroundColor Cyan
+    Write-Host $line
+    Write-Host $header
+    Write-Host $line
+
+    foreach ($row in $states | Sort-Object -Property MachineName) {
+        $machineValue = [string]$row.MachineName
+        if ([string]::IsNullOrWhiteSpace($machineValue)) {
+            $machineValue = 'Unknown'
+        }
+        if ($machineValue.Length -gt $machineWidth) {
+            $machineValue = $machineValue.Substring(0, $machineWidth)
+        }
+
+        $stateValue = [string]$row.DerivedState
+        if ([string]::IsNullOrWhiteSpace($stateValue)) {
+            $stateValue = 'UnknownState'
+        }
+        if ($stateValue.Length -gt $stateWidth) {
+            $stateValue = $stateValue.Substring(0, $stateWidth)
+        }
+
+        $machineCell = $machineValue.PadRight($machineWidth)
+        $stateCell = $stateValue.PadRight($stateWidth)
+        $rowLine = "|$machineCell|$stateCell|"
+
+        $rowColor = if ($row.DerivedState -eq 'ReadyMachines') { 'Green' } else { 'Red' }
+        Write-Host $rowLine -ForegroundColor $rowColor
+    }
+
+    Write-Host $line
+    Write-Log "Pre-validation-only summary: Total=$totalCount, Ready=$readyCount, Excluded=$($totalCount - $readyCount), DurationSeconds=$([int]$duration.TotalSeconds)" -Level INFO
 }
 
 # ============================================================================
@@ -2165,11 +2326,12 @@ function Main {
         $credential = Get-ValidatedCredentialForDomain
         $credential = Get-CredentialAfterUserConfirmation -CurrentCredential $credential
 
-        Write-Log 'Starting five-state machine pre-validation for batch list.' -Level INFO
-        $availabilityReport = Get-MachineAvailabilityReport -InputMachines $rawBatchMachines
+        Write-Log 'Executing machine-state validation for batch processing list.' -Level INFO
+        $availabilityReport = Get-MachineAvailabilityReport -InputMachines $rawBatchMachines -ShowProgressSpinner $true -ProgressMessage 'Machine-state validation in progress for batch processing list'
         $validatedMachines = @($availabilityReport.ReadyMachines)
 
         if ($validatedMachines.Count -eq 0) {
+            Write-MachineStateValidationSummary -MachineStates $availabilityReport.MachineStates -RunStart $runStart
             throw 'No machines are fully reachable for deployment after pre-validation.'
         }
 

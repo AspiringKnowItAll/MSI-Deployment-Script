@@ -111,17 +111,20 @@ PHASE 12: Cleanup, per-machine retries, summary, and logging
 14. Batch mode fails fast if no machine is fully reachable after pre-validation.
 15. Operator is always shown active execution account and can choose alternate credentials before canary/deployment.
 16. Authorization canary validates remote-admin rights on up to 3 ready machines before deployment starts.
+17. Batch pre-validation emits in-place status updates (non-animated) and uses the operator-facing wording: "Executing machine-state validation for batch processing list."
+18. If pre-validation yields zero ready machines, script prints a machine-state summary table (all parsed machines + derived state) before terminating.
 
 ---
 
 ## Known Behaviors / Notes
 
 - Parallel execution requires PowerShell 7+; script falls back to sequential when unavailable.
-- Console uses spinner-style progress for install/batch activity in long-running operations.
+- Console uses animated spinner progress for installer execution and in-place status updates for batch pre-validation.
 - Quiet MSI execution does not provide reliable granular percentage progress.
 - Aggregated run log is reused across PS5→PS7 relaunch path via `-RunLogPath`.
 - Reachability-only machines with WinRM disabled are excluded before deployment.
 - Authorization canary failure stops deployment before install execution begins.
+- Zero-ready pre-validation now renders a summary table so operators can review derived state per machine even when no install jobs run.
 
 ---
 
@@ -155,6 +158,8 @@ Remote machine prerequisites:
 - [ ] Domain credential validation rejects invalid credentials within 2 attempts
 - [ ] Account confirmation prompt always displays active execution identity
 - [ ] Batch pre-validation correctly classifies all five machine states
+- [ ] In-place pre-validation status updates appear after the operator-facing validation message
+- [ ] If zero machines are ready after pre-validation, summary table still lists all machines with derived state
 - [ ] Authorization canary checks up to 3 machines and blocks deployment on failure
 - [ ] Transfer retry and retry-cycle prompt works
 - [ ] Failed-machine-only retry prompt logic works
