@@ -159,15 +159,73 @@ function Test-ComputerOnline {
     )
 
     try {
+        $tcpAvailable = $false
+
         try {
-            $tcpTest = Test-Connection -TargetName $ComputerName -TcpPort 5985 -Quiet -Count 1 -TimeoutSeconds 5
-            if ($tcpTest) { return $true }
+            if (Get-Command -Name Test-NetConnection -ErrorAction SilentlyContinue) {
+                $tcpAvailable = [bool](Test-NetConnection -ComputerName $ComputerName -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop)
+            }
+            else {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                try {
+                    $connectResult = $tcpClient.BeginConnect($ComputerName, 5985, $null, $null)
+                    $connectedInTime = $connectResult.AsyncWaitHandle.WaitOne(5000, $false)
+                    if ($connectedInTime) {
+                        $tcpAvailable = $true
+                    }
+                }
+                finally {
+                    try { [void]$tcpClient.EndConnect($connectResult) } catch { }
+                    try {
+                        if ($connectResult -and $connectResult.AsyncWaitHandle) {
+                            $connectResult.AsyncWaitHandle.Close()
+                        }
+                    }
+                    catch { }
+
+                    if ($tcpClient) {
+                        $tcpClient.Close()
+                    }
+                }
+            }
         }
         catch {
-            # ignore and fallback
+            # ignore and fallback to ICMP check
         }
 
-        $ping = Test-Connection -TargetName $ComputerName -Quiet -Count 1 -TimeoutSeconds 5
+        if ($tcpAvailable) {
+            return $true
+        }
+
+        $testConnection = Get-Command -Name Test-Connection -ErrorAction SilentlyContinue
+        if (-not $testConnection) {
+            return $false
+        }
+
+        $pingParams = @{
+            Quiet = $true
+            Count = 1
+            ErrorAction = 'Stop'
+        }
+
+        if ($testConnection.Parameters.ContainsKey('ComputerName')) {
+            $pingParams['ComputerName'] = $ComputerName
+        }
+        elseif ($testConnection.Parameters.ContainsKey('TargetName')) {
+            $pingParams['TargetName'] = $ComputerName
+        }
+        else {
+            return $false
+        }
+
+        if ($testConnection.Parameters.ContainsKey('TimeoutSeconds')) {
+            $pingParams['TimeoutSeconds'] = 5
+        }
+        elseif ($testConnection.Parameters.ContainsKey('TimeoutMilliseconds')) {
+            $pingParams['TimeoutMilliseconds'] = 5000
+        }
+
+        $ping = Test-Connection @pingParams
         return [bool]$ping
     }
     catch {
@@ -230,7 +288,7 @@ function Get-ValidatedSingleHostname {
 }
 
 function Get-ExecutionMode {
-    Write-Host "`n" + ('=' * 70)
+    Write-Host ("`n" + ('=' * 70))
     Write-Host 'Remote MSI Installation Tool' -ForegroundColor Cyan
     Write-Host ('=' * 70)
     Write-Host '[1] Single Machine'
@@ -696,6 +754,8 @@ function Test-DomainCredential {
         [Parameter(Mandatory = $true)]
         [pscredential]$Credential
     )
+
+    Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction SilentlyContinue
 
     $result = [pscustomobject]@{
         IsValid = $false
@@ -1200,7 +1260,7 @@ function Write-MachineStateValidationSummary {
     $totalCount = $states.Count
     $readyCount = @($states | Where-Object { $_.DerivedState -eq 'ReadyMachines' }).Count
 
-    Write-Host "`n" + ('=' * 70)
+    Write-Host ("`n" + ('=' * 70))
     Write-Host 'Deployment Summary' -ForegroundColor Cyan
     Write-Host ('=' * 70)
     Write-Host 'OVERALL RESULT: FAILED' -ForegroundColor Red
@@ -1371,8 +1431,12 @@ function Get-PendingRebootState {
             }
 
             try {
-                $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-                if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
+                $wmi = if (Get-Command -Name Get-CimInstance -ErrorAction SilentlyContinue) {
+                    Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                } else {
+                    Get-WmiObject -Class Win32_OperatingSystem -ErrorAction SilentlyContinue
+                }
+                if ($wmi -and $wmi.RebootRequired) {
                     $state.WmiRebootRequired = $true
                 }
             }
@@ -1845,8 +1909,12 @@ function Invoke-Deployment {
                                 catch {}
 
                                 try {
-                                    $wmi = Get-WmiObject -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-                                    if ($wmi -and $wmi.PSBase.Properties['RebootRequired'] -and $wmi.RebootRequired) {
+                                    $wmi = if (Get-Command -Name Get-CimInstance -ErrorAction SilentlyContinue) {
+                                        Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                                    } else {
+                                        Get-WmiObject -Class Win32_OperatingSystem -ErrorAction SilentlyContinue
+                                    }
+                                    if ($wmi -and $wmi.RebootRequired) {
                                         $state.WmiRebootRequired = $true
                                     }
                                 }
@@ -2166,7 +2234,7 @@ function Write-Summary {
     $rebootCount = @($FinalResults | Where-Object { $_.RebootRequired }).Count
     $duration = (Get-Date) - $RunStart
 
-    Write-Host "`n" + ('=' * 70)
+    Write-Host ("`n" + ('=' * 70))
     Write-Host 'Deployment Summary' -ForegroundColor Cyan
     Write-Host ('=' * 70)
     $overallStatus = if ($failedCount -eq 0) { 'SUCCESS' } elseif ($successCount -gt 0) { 'PARTIAL SUCCESS' } else { 'FAILED' }
