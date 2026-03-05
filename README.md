@@ -12,6 +12,9 @@ Core behaviors:
 - Supports transfer retry cycles and per-machine retry rounds
 - Produces one aggregated run log per execution
 
+## Documentation
+- Domain admin deep dive: [Domain-Admin-Detailed-Explanation.md](Domain-Admin-Detailed-Explanation.md)
+
 ---
 
 ## Features
